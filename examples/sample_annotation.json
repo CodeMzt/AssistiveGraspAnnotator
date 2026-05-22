@@ -1,0 +1,38 @@
+{
+  "image_id": "000001",
+  "image_path": "images/board_vga/000001.jpg",
+  "width": 640,
+  "height": 480,
+  "camera": "board_vga",
+  "source": "board",
+  "split": "train",
+  "objects": [
+    {
+      "instance_id": 1,
+      "class_id": 0,
+      "class_name": "phone_A",
+      "bbox_xyxy": [220, 160, 380, 300],
+      "graspable": true,
+      "policy": "grasp_rect",
+      "grasps": [
+        {
+          "grasp_id": 1,
+          "points": [[245, 220], [355, 220], [355, 245], [245, 245]],
+          "axis_convention": "p0_to_p1_is_grasp_width_axis",
+          "quality": 1.0,
+          "difficulty": "easy",
+          "note": "middle cross grasp"
+        }
+      ]
+    },
+    {
+      "instance_id": 2,
+      "class_id": 6,
+      "class_name": "cup_other",
+      "bbox_xyxy": [430, 180, 520, 300],
+      "graspable": false,
+      "policy": "report_only",
+      "grasps": []
+    }
+  ]
+}
