@@ -303,3 +303,43 @@ def rasterize_polygon(
             if point_in_polygon(col + 0.5, row + 0.5, polygon):
                 pixels.append((row, col))
     return pixels
+
+
+def compute_compact_polygon(
+    points: Sequence[Point2f], factor: float = 1.0 / 3.0
+) -> GraspPoints:
+    """Shrink grasp rectangle to its center portion along both axes.
+
+    points: [p0, p1, p2, p3] where p0→p1=width, p1→p2=depth.
+    factor: fraction of original size to keep (GG-CNN uses 1/3).
+
+    Returns 4-point polygon of the shrunken center region.
+    """
+    if len(points) < 4:
+        return list(points)
+
+    p0, p1, p2 = points[0], points[1], points[2]
+    center = grasp_center(points)
+    g_width = grasp_width(points)
+    g_depth = grasp_depth(points)
+
+    if g_width < 1e-6 or g_depth < 1e-6:
+        return [center, center, center, center]
+
+    w_dir = normalize((p1[0] - p0[0], p1[1] - p0[1]))
+    d_dir = normalize((p2[0] - p1[0], p2[1] - p1[1]))
+
+    half_w = g_width * 0.5 * factor
+    half_d = g_depth * 0.5 * factor
+    cx, cy = center
+
+    return [
+        (cx - w_dir[0] * half_w - d_dir[0] * half_d,
+         cy - w_dir[1] * half_w - d_dir[1] * half_d),
+        (cx + w_dir[0] * half_w - d_dir[0] * half_d,
+         cy + w_dir[1] * half_w - d_dir[1] * half_d),
+        (cx + w_dir[0] * half_w + d_dir[0] * half_d,
+         cy + w_dir[1] * half_w + d_dir[1] * half_d),
+        (cx - w_dir[0] * half_w + d_dir[0] * half_d,
+         cy - w_dir[1] * half_w + d_dir[1] * half_d),
+    ]

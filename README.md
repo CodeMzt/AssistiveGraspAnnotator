@@ -118,18 +118,28 @@ class_id cx_norm cy_norm w_norm h_norm
 
 Each graspable object produces one `.npz` file containing pixel-level supervision maps.
 
+Format follows GG-CNN (Morrison et al., RSS 2018): square maps, compact-polygon (centre-1/3) encoding, sin(2θ)/cos(2θ) angle wrapping.
+
 ### .npz Keys
 
 | Key | Shape | dtype | Range | Description |
 |-----|-------|-------|-------|-------------|
-| `q_map` | (H, W) | float32 | [0, 1] | Per-pixel grasp quality (Gaussian-smoothed) |
-| `sin2theta_map` | (H, W) | float32 | [-1, 1] | sin(2θ) orientation encoding |
-| `cos2theta_map` | (H, W) | float32 | [-1, 1] | cos(2θ) orientation encoding |
-| `width_map` | (H, W) | float32 | [0, …] | Grasp width in map pixels |
+| `q_map` | (S, S) | float32 | [0, 1] | Per-pixel grasp quality |
+| `sin2theta_map` | (S, S) | float32 | [-1, 1] | sin(2θ) orientation encoding |
+| `cos2theta_map` | (S, S) | float32 | [-1, 1] | cos(2θ) orientation encoding |
+| `width_map` | (S, S) | float32 | [0, 1] | Grasp width, normalised by map_size |
 
 ### Map dimensions
 
-Default `320 × 240` (configurable via `map_size` parameter). The ROI image is resized to this resolution, and grasp points are scaled accordingly.
+Default `300 × 300` (square, matches GG-CNN). Configurable via `map_size` parameter.
+
+### ROI letterbox
+
+The ROI crop (bbox + 20% padding) is resized with **preserved aspect ratio** and centred on a black canvas — no stretching distortion.
+
+### Compact polygon encoding (GG-CNN convention)
+
+Only the **centre third** of each grasp rectangle is set as positive in Q_map (binary fill). This teaches the network to predict grasp *centres*, not arbitrary points inside the rectangle.
 
 ### Quality mapping
 
@@ -146,8 +156,7 @@ When multiple grasps overlap on the same pixel, the one with the **highest quali
 
 ### Orientation encoding
 
-θ is the angle of the grasp width axis (p0 → p1), measured from positive x-axis in radians.  
-Instead of raw θ, the maps encode `sin(2θ)` and `cos(2θ)`, which avoids the wrap-around discontinuity at ±π.
+θ = atan2(p1.y − p0.y, p1.x − p0.x). Encoded as sin(2θ) and cos(2θ) to avoid the wrap-around discontinuity at ±π/2 (antipodal grasps are equivalent).
 
 ### Training usage
 
