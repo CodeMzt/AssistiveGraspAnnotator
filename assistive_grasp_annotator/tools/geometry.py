@@ -287,3 +287,19 @@ def closest_point_on_segment(
         return (x1, y1)
     t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
     return (x1 + t * dx, y1 + t * dy)
+
+
+def rasterize_polygon(
+    polygon: Sequence[Point2f], h: int, w: int
+) -> list[tuple[int, int]]:
+    """Return list of (row, col) pixel indices inside the polygon.
+
+    Tests each pixel center (col+0.5, row+0.5) against the polygon.
+    Suitable for small-to-medium map sizes (e.g. 320×240).
+    """
+    pixels: list[tuple[int, int]] = []
+    for row in range(h):
+        for col in range(w):
+            if point_in_polygon(col + 0.5, row + 0.5, polygon):
+                pixels.append((row, col))
+    return pixels

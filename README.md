@@ -1,22 +1,16 @@
 # AssistiveGraspAnnotator
 
-Desktop annotation tool for assistive grasping datasets. Supports labeling object bounding boxes and grasp rectangles for a two-stage detection + grasp-prediction pipeline.
+Desktop annotation tool for assistive grasping datasets. Supports labeling object bounding boxes and grasp rectangles, then exporting training data for both the detection model (Model A) and grasp prediction model (Model B).
 
 ## Install
 
 ```bash
-# Create and activate a virtual environment
 python -m venv .venv
 .venv\Scripts\activate
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-Requirements:
-- Python 3.10+
-- PySide6 ≥ 6.5.0
-- Pillow, NumPy, PyYAML
+Requirements: Python 3.10+, PySide6 ≥ 6.5, Pillow, NumPy, PyYAML.
 
 ## Run
 
@@ -28,63 +22,175 @@ python -m assistive_grasp_annotator.main
 
 ```
 dataset_root/
-  classes.yaml              # Class ontology (required)
+  classes.yaml              # Class ontology (required for class labels)
   images/
     board_vga/              # Camera subdirectories
       000001.jpg
-      000002.jpg
-    phone/
-      100001.jpg
-  annotations/              # Auto-created on save
+  annotations/              # Auto-created per-image JSON
     000001.json
-    000002.json
   splits/                   # Optional: train.txt, val.txt
-  generated/                # Exported data (YOLO labels, ROI crops)
+  generated/                # Exported training data (created by export)
 ```
 
 ## Keyboard Shortcuts
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+O` | Open dataset directory |
+| `Ctrl+N` | New Dataset (from raw image folder) |
+| `Ctrl+O` | Open Dataset |
 | `Ctrl+S` | Save current annotation |
 | `Ctrl+Shift+S` | Save all annotations |
 | `A` | BBox mode — click & drag to draw |
-| `G` | Grasp mode — 3 clicks (p0, p1, p2) |
+| `G` | Grasp mode — first select an object, then 3 clicks (p0→p1→p2) |
 | `V` | Select mode — move/resize items |
 | `Delete` | Delete selected object or grasp |
 | `N / Right` | Next image |
 | `P / Left` | Previous image |
-| `1` | Set difficulty: easy |
-| `2` | Set difficulty: medium |
-| `3` | Set difficulty: hard |
-| `4` | Set difficulty: invalid |
+| `1 / 2 / 3 / 4` | Set difficulty: easy / medium / hard / invalid |
 | `Esc` | Cancel drawing / deselect |
-| `Ctrl++` | Zoom in |
-| `Ctrl+-` | Zoom out |
+| `Ctrl++/-` | Zoom in/out |
 | `Ctrl+0` | Zoom to fit |
 | `Scroll` | Zoom in/out |
 | `Space+drag` | Pan image |
 
 ## Annotation Workflow
 
-1. **Open dataset** — `Ctrl+O`, select the dataset root directory
-2. **Draw bbox** — Press `A`, click and drag on the image to draw a bounding box
-3. **Assign class** — Select the object in the right panel, pick a class from the dropdown
-4. **Draw grasp** — Select an object, press `G`, then click 3 points:
-   - Click 1: p0 (width axis start)
-   - Click 2: p1 (width axis end)
-   - Click 3: p2 (depth axis end); p3 is auto-computed
-5. **Set difficulty** — Select the grasp, press `1`-`4` or use the dropdown
+1. **Open or create dataset** — `Ctrl+O` (existing) or `Ctrl+N` (new from raw images)
+2. **Draw bbox** — Press `A`, click and drag on the image
+3. **Assign class** — Select the object in right panel, pick class from dropdown
+4. **Draw grasp** — Select an object (click it in V mode), press `G`, then click 3 points:
+   - Click 1: **p0** (width axis start)
+   - Click 2: **p1** (width axis end) — the axis from p0→p1 defines the gripper closing direction
+   - Click 3: **p2** (depth axis end) — p3 is auto-computed as a parallelogram
+5. **Set difficulty** — Press `1`-`4` or use dropdown (easy/medium/hard/invalid)
 6. **Save** — `Ctrl+S` (atomic write: temp file → rename)
 
 ## Grasp Rectangle Convention
 
 ```
-p0 → p1 = grasp_width_axis   (gripper open/close direction, cyan arrow)
-p1 → p2 = finger_depth_axis  (finger insertion depth, magenta arrow)
-p3 = p0 + (p2 - p1)          (auto-computed parallelogram)
+p0 ──→ p1  =  grasp_width_axis   (gripper open/close direction, cyan arrow)
+p1 ──→ p2  =  finger_depth_axis  (finger insertion depth, magenta arrow)
+p3 = p0 + (p2 - p1)               (parallelogram, auto-computed)
 ```
+
+---
+
+## Training Data Pipeline
+
+```
+annotations/000001.json          ← Human-edited master annotation
+         │
+         ├──→  Export → Export YOLO Labels
+         │         └──→ generated/detector_yolo/000001.txt     (Model A)
+         │
+         └──→  Export → Export Target Maps (.npz)
+                   └──→ generated/target_maps/000001/
+                            obj_001.png                         (ROI image)
+                            obj_001.npz   ← q_map, sin2θ, cos2θ, width
+                            obj_001.json  ← metadata
+```
+
+---
+
+## Model A: Detection (YOLO format)
+
+Each image gets one `.txt` file with one line per annotated object:
+
+```
+class_id cx_norm cy_norm w_norm h_norm
+```
+
+| Field | Description | Range |
+|-------|-------------|-------|
+| `class_id` | Integer class index from classes.yaml | 0..N-1 |
+| `cx_norm` | Bbox center x / image width | [0, 1] |
+| `cy_norm` | Bbox center y / image height | [0, 1] |
+| `w_norm` | Bbox width / image width | [0, 1] |
+| `h_norm` | Bbox height / image height | [0, 1] |
+
+**Export**: `Export → Export YOLO Labels`  
+**Output**: `generated/detector_yolo/{camera}/{image_id}.txt`  
+**Compatible with**: YOLOv5/v8/v11, Ultralytics, any normalized-bbox detector.
+
+---
+
+## Model B: Grasp Prediction (Target Maps)
+
+Each graspable object produces one `.npz` file containing pixel-level supervision maps.
+
+### .npz Keys
+
+| Key | Shape | dtype | Range | Description |
+|-----|-------|-------|-------|-------------|
+| `q_map` | (H, W) | float32 | [0, 1] | Per-pixel grasp quality (Gaussian-smoothed) |
+| `sin2theta_map` | (H, W) | float32 | [-1, 1] | sin(2θ) orientation encoding |
+| `cos2theta_map` | (H, W) | float32 | [-1, 1] | cos(2θ) orientation encoding |
+| `width_map` | (H, W) | float32 | [0, …] | Grasp width in map pixels |
+
+### Map dimensions
+
+Default `320 × 240` (configurable via `map_size` parameter). The ROI image is resized to this resolution, and grasp points are scaled accordingly.
+
+### Quality mapping
+
+| Difficulty | Quality |
+|-----------|---------|
+| easy | 1.0 |
+| medium | 0.7 |
+| hard | 0.4 |
+| invalid | 0.0 (excluded from maps) |
+
+### Overlap handling
+
+When multiple grasps overlap on the same pixel, the one with the **highest quality** takes precedence for all map channels.
+
+### Orientation encoding
+
+θ is the angle of the grasp width axis (p0 → p1), measured from positive x-axis in radians.  
+Instead of raw θ, the maps encode `sin(2θ)` and `cos(2θ)`, which avoids the wrap-around discontinuity at ±π.
+
+### Training usage
+
+```python
+import numpy as np
+data = np.load("obj_001.npz")
+q_map   = data["q_map"]          # (240, 320) float32
+sin2t   = data["sin2theta_map"]  # (240, 320) float32
+cos2t   = data["cos2theta_map"]  # (240, 320) float32
+width   = data["width_map"]      # (240, 320) float32
+
+# Recover angle:  θ = 0.5 * atan2(sin2t, cos2t)
+# Recover quality at each pixel: q_map[pixel]
+```
+
+**Export**: `Export → Export Target Maps (.npz)`  
+**Output**: `generated/target_maps/{image_id}/obj_{instance_id:03d}.{png,npz,json}`
+
+### Companion ROI JSON
+
+Each .npz is accompanied by a `obj_{id}.json` with metadata:
+
+```json
+{
+  "source_image": "images/board_vga/000001.jpg",
+  "source_bbox": [220, 160, 380, 300],
+  "padded_bbox": [204, 144, 396, 316],
+  "map_size": [320, 240],
+  "instance_id": 1,
+  "class_id": 0,
+  "class_name": "phone_A",
+  "grasps": [
+    {
+      "grasp_id": 1,
+      "points_roi": [[41.0, 76.0], [151.0, 76.0], [151.0, 101.0], [41.0, 101.0]],
+      "quality": 1.0,
+      "difficulty": "easy"
+    }
+  ]
+}
+```
+
+---
 
 ## Annotation JSON Format
 
@@ -122,15 +228,14 @@ Each image gets one JSON file under `annotations/`:
 }
 ```
 
-## Export
-
-- **Export → Export YOLO Labels**: Generates `class_id cx cy w h` .txt files (normalized) under `generated/detector_yolo/`
-- **Export → Export Grasp ROIs**: Crops each graspable object's bbox (+20% padding), transforms grasp points to ROI-local coordinates, saves images + JSON under `generated/grasp_roi/`
+---
 
 ## Validation
 
-- **Validate → Validate Current**: Checks bbox bounds, grasp points, difficulty/quality values, graspable constraints
-- **Validate → Validate All**: Validates all annotations in the dataset
+- **Validate → Validate Current**: checks bbox bounds, grasp points, difficulty/quality values
+- **Validate → Validate All**: validates all annotations in the dataset
+
+---
 
 ## Project Structure
 
@@ -142,20 +247,22 @@ AssistiveGraspAnnotator/
     classes.yaml
     sample_annotation.json
   assistive_grasp_annotator/
-    main.py               # Entry point
-    app.py                 # QApplication wrapper
+    main.py                  # Entry point
+    app.py                   # QApplication wrapper
     models/
-      classes.py           # ClassInfo, ClassRegistry (from classes.yaml)
-      annotation.py        # ObjectAnnotation, GraspAnnotation, AnnotationModel
-      dataset.py           # DatasetModel: open dir, scan images, navigate
+      classes.py             # ClassInfo, ClassRegistry
+      annotation.py          # ObjectAnnotation, GraspAnnotation, AnnotationModel
+      dataset.py             # DatasetModel: open/create, scan, navigate
     ui/
-      image_canvas.py      # QGraphicsView: zoom/pan, bbox/grasp drawing, handles
-      side_panel.py        # Right panel: object list, class combo, grasp editor
-      main_window.py       # MainWindow: menus, 3-panel layout, shortcuts
+      image_canvas.py        # QGraphicsView: zoom/pan, bbox/grasp drawing, handles
+      side_panel.py          # Right panel: object/grasp lists, editors
+      main_window.py         # MainWindow: menus, layout, shortcuts, signal wiring
+      class_editor.py        # Class editor table + dialog
+      dataset_wizard.py      # New Dataset wizard dialog
     tools/
-      geometry.py          # Pure geometry functions (no Qt dependency)
-      validators.py        # Annotation validation rules
-      export_yolo.py       # YOLO label export
-      export_grasp_roi.py  # Grasp ROI crop + JSON export
-      export_target_maps.py # Stub for future .npz target maps
+      geometry.py            # Pure geometry functions
+      validators.py          # Annotation validation rules
+      export_yolo.py         # Model A: YOLO label export
+      export_grasp_roi.py    # Grasp ROI crop + JSON export
+      export_target_maps.py  # Model B: .npz target map export
 ```

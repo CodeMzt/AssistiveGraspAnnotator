@@ -127,6 +127,7 @@ class MainWindow(QMainWindow):
         export_menu = mb.addMenu("&Export")
         export_menu.addAction("Export YOLO &Labels...", self._export_yolo)
         export_menu.addAction("Export Grasp &ROIs...", self._export_grasp_roi)
+        export_menu.addAction("Export &Target Maps (.npz)...", self._export_target_maps)
 
         # Validate
         validate_menu = mb.addMenu("&Validate")
@@ -502,6 +503,19 @@ class MainWindow(QMainWindow):
         count, errors = export_grasp_rois(self._dataset, out_dir)
         QMessageBox.information(self, "Export Completed",
                                 f"Exported {count} grasp ROI(s)." +
+                                (f" {errors} error(s)." if errors else ""))
+
+    def _export_target_maps(self):
+        from assistive_grasp_annotator.tools.export_target_maps import export_target_maps
+        default_dir = ""
+        if self._dataset.dataset_path is not None:
+            default_dir = str(self._dataset.dataset_path / "generated" / "target_maps")
+        out_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory for Target Maps", default_dir)
+        if not out_dir:
+            return
+        count, errors = export_target_maps(self._dataset, out_dir)
+        QMessageBox.information(self, "Export Completed",
+                                f"Exported {count} target map set(s)." +
                                 (f" {errors} error(s)." if errors else ""))
 
     # ------------------------------------------------------------------
