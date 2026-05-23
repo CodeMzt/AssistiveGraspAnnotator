@@ -163,10 +163,10 @@ When multiple grasps overlap on the same pixel, the one with the **highest quali
 ```python
 import numpy as np
 data = np.load("obj_001.npz")
-q_map   = data["q_map"]          # (240, 320) float32
-sin2t   = data["sin2theta_map"]  # (240, 320) float32
-cos2t   = data["cos2theta_map"]  # (240, 320) float32
-width   = data["width_map"]      # (240, 320) float32
+q_map   = data["q_map"]          # (300, 300) float32
+sin2t   = data["sin2theta_map"]  # (300, 300) float32
+cos2t   = data["cos2theta_map"]  # (300, 300) float32
+width   = data["width_map"]      # (300, 300) float32
 
 # Recover angle:  θ = 0.5 * atan2(sin2t, cos2t)
 # Recover quality at each pixel: q_map[pixel]
@@ -184,14 +184,16 @@ Each .npz is accompanied by a `obj_{id}.json` with metadata:
   "source_image": "images/board_vga/000001.jpg",
   "source_bbox": [220, 160, 380, 300],
   "padded_bbox": [204, 144, 396, 316],
-  "map_size": [320, 240],
+  "map_size": 300,
+  "letterbox_offset": [22, 22],
+  "scale": 1.071428,
   "instance_id": 1,
   "class_id": 0,
   "class_name": "phone_A",
   "grasps": [
     {
       "grasp_id": 1,
-      "points_roi": [[41.0, 76.0], [151.0, 76.0], [151.0, 101.0], [41.0, 101.0]],
+      "points_map": [[70.7, 81.4], [155.4, 81.4], [155.4, 107.1], [70.7, 107.1]],
       "quality": 1.0,
       "difficulty": "easy"
     }
