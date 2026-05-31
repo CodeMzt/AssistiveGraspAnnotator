@@ -28,3 +28,18 @@ test_flat/
 test_bugs/
 *.tmp
 .claude/
+.codegraph/
+.aga_uploads/
+.aga_state.sqlite3
+web_frontend/node_modules/
+web_frontend/dist/
+
+# FRP tunnel client/config/secrets
+frp/
+frp_*.zip
+frp_*/
+frpc.exe
+frps.exe
+frpc.toml
+frps.toml
+scripts/start_frpc.ps1

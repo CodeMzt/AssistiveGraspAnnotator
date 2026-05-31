@@ -18,6 +18,102 @@ Requirements: Python 3.10+, PySide6 ≥ 6.5, Pillow, NumPy, PyYAML.
 python -m assistive_grasp_annotator.main
 ```
 
+## Run Web Collaboration Server
+
+The browser UI is built once by Vite, then served by the same Python/FastAPI
+process as the API. No separate frontend server is needed in deployment.
+
+```bash
+pip install -r requirements-dev.txt
+cd web_frontend
+npm install
+npm run build
+cd ..
+```
+
+Start the local service with the one-click Windows launcher:
+
+```bat
+start_web.bat
+```
+
+The launcher creates and uses the project-local `.venv` automatically, then
+installs only the Web runtime dependencies from `requirements-web.txt` into that
+virtual environment. It does not install packages into the system Python.
+
+By default the managed dataset library is fixed at
+`D:\AssistiveGraspAnnotatorData\datasets`. The Web UI manages datasets by
+dataset name; paths stay internal to the server.
+
+Or start the same service from PowerShell:
+
+```bash
+.\scripts\start_web.ps1
+```
+
+Then open `http://<server-ip>:8000/` from the intranet. Users enter a
+username, select or create a named dataset, upload images, acquire an image
+lock, annotate, save, validate, and export.
+
+Large browser uploads use chunked transfer so they can pass through small
+reverse-proxy body limits. The frontend sends about 960 KiB per chunk, prequeues
+parallel requests, and shows confirmed chunk count plus aggregate throughput.
+If a public nginx sits in front of FRP, disable request buffering so nginx
+streams each chunk to FRP while the browser is still sending it; otherwise the
+browser can show a chunk as uploaded while nginx is still forwarding it upstream.
+
+```nginx
+server {
+    client_max_body_size 200m;
+
+    location / {
+        proxy_pass http://127.0.0.1:18080;
+        proxy_http_version 1.1;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+```
+
+The browser may still physically upload only about six concurrent requests over
+plain HTTP/1.1. The Web UI defaults to `Turbo x18` so extra chunks are already
+queued when a connection frees up. For true higher-than-six concurrency from
+the browser, terminate HTTPS on nginx and enable HTTP/2.
+
+Web save behavior intentionally matches the desktop tool: saving writes the
+annotation JSON as an intermediate state after lock/ETag/basic-shape checks.
+Validation warnings and errors are reported through `Validate` but do not block
+save.
+
+Key environment variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `AGA_DATASET_ROOTS` | Semicolon-separated whitelist of server/share roots allowed for opening datasets |
+| `AGA_UPLOAD_ROOT` | Managed directory where browser-created datasets are stored |
+| `AGA_STATE_DB` | SQLite file for Web-only state: registered datasets, locks, jobs, audit rows |
+| `AGA_LOCK_TTL_SECONDS` | Edit lock timeout in seconds, default `900` |
+| `AGA_PORT` | Server port, default `8000` |
+
+Recommended repair/regression checks:
+
+```bash
+python -m unittest tests.test_web_backend
+cd web_frontend
+npm test
+npm run build
+cd ..
+python -m compileall assistive_grasp_annotator tests
+```
+
+For real acceptance, start `python -m assistive_grasp_annotator.web.server`,
+open the page, log in, open a whitelisted dataset, acquire an image lock, draw a
+bbox and a three-click grasp, edit difficulty/note, save, refresh, and verify the
+saved `annotations/{camera}/{image}.json` plus the three exports under
+`generated/`.
+
 ## Dataset Structure
 
 ```
