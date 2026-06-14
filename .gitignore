@@ -31,6 +31,11 @@ test_bugs/
 .codegraph/
 .aga_uploads/
 .aga_state.sqlite3
+.aga_state.sqlite3-shm
+.aga_state.sqlite3-wal
+web_frontend/.aga_state.sqlite3
+web_frontend/.aga_state.sqlite3-shm
+web_frontend/.aga_state.sqlite3-wal
 web_frontend/node_modules/
 web_frontend/dist/
 

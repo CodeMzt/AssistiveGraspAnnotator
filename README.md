@@ -1,6 +1,6 @@
 # AssistiveGraspAnnotator
 
-Desktop annotation tool for assistive grasping datasets. Supports labeling object bounding boxes and grasp rectangles, then exporting training data for both the detection model (Model A) and grasp prediction model (Model B).
+Desktop and web annotation tool for assistive grasping datasets. The current system contract is Model A V2 / EthosSafeDetV2: scene-level OV5640 VGA annotations provide class, bbox, and optional orientation labels for a single detection/localization/orientation model. The historical Model B/ROI grasp-rectangle export path is deprecated reference tooling only.
 
 ## Install
 
@@ -110,8 +110,8 @@ python -m compileall assistive_grasp_annotator tests
 
 For real acceptance, start `python -m assistive_grasp_annotator.web.server`,
 open the page, log in, open a whitelisted dataset, acquire an image lock, draw a
-bbox and a three-click grasp, edit difficulty/note, save, refresh, and verify the
-saved `annotations/{camera}/{image}.json` plus the three exports under
+bbox and a two-point main axis when required, edit difficulty/note, save, refresh, and verify the
+saved `annotations/{camera}/{image}.json` plus the V2 exports under
 `generated/`.
 
 ## Dataset Structure
@@ -136,10 +136,10 @@ dataset_root/
 | `Ctrl+O` | Open Dataset |
 | `Ctrl+S` | Save current annotation |
 | `Ctrl+Shift+S` | Save all annotations |
-| `A` | BBox mode — click & drag to draw |
-| `G` | Grasp mode — first select an object, then 3 clicks (p0→p1→p2) |
-| `V` | Select mode — move/resize items |
-| `Delete` | Delete selected object or grasp |
+| `C` / `A` | BBox mode — click & drag to draw |
+| `E` | Axis mode — first select an object, then 2 clicks for `main_axis_points` |
+| `Q` / `V` | Select mode — move/resize items |
+| `Delete` | Delete selected object or annotation handle |
 | `N / Right` | Next image |
 | `P / Left` | Previous image |
 | `1 / 2 / 3 / 4` | Set difficulty: easy / medium / hard / invalid |
@@ -154,20 +154,13 @@ dataset_root/
 1. **Open or create dataset** — `Ctrl+O` (existing) or `Ctrl+N` (new from raw images)
 2. **Draw bbox** — Press `A`, click and drag on the image
 3. **Assign class** — Select the object in right panel, pick class from dropdown
-4. **Draw grasp** — Select an object (click it in V mode), press `G`, then click 3 points:
-   - Click 1: **p0** (width axis start)
-   - Click 2: **p1** (width axis end) — the axis from p0→p1 defines the gripper closing direction
-   - Click 3: **p2** (depth axis end) — p3 is auto-computed as a parallelogram
+4. **Draw main axis when needed** — For graspable preset classes with a stable direction, mark `yaw_label_status=valid` and add the two-point main axis. Directionless, ambiguous, or occluded objects must keep an explicit non-valid yaw status.
 5. **Set difficulty** — Press `1`-`4` or use dropdown (easy/medium/hard/invalid)
 6. **Save** — `Ctrl+S` (atomic write: temp file → rename)
 
-## Grasp Rectangle Convention
+## Model A V2 Orientation Convention
 
-```
-p0 ──→ p1  =  grasp_width_axis   (gripper open/close direction, cyan arrow)
-p1 ──→ p2  =  finger_depth_axis  (finger insertion depth, magenta arrow)
-p3 = p0 + (p2 - p1)               (parallelogram, auto-computed)
-```
+Orientation is an image-plane object/main-axis angle in the original VGA coordinate system. Exporters encode it as `sin(2theta)` and `cos(2theta)` so antipodal directions share one representation. Orientation is valid only when `yaw_label_status == "valid"` and `main_axis_points` exist; otherwise `theta_valid`/`angle_mask` must be false.
 
 ---
 
@@ -176,24 +169,24 @@ p3 = p0 + (p2 - p1)               (parallelogram, auto-computed)
 ```
 annotations/000001.json          ← Human-edited master annotation
          │
-         ├──→  Export → Export YOLO Labels
-         │         └──→ generated/detector_yolo/000001.txt     (Model A)
+         ├──→  Export → Export YOLO-Angle Labels
+         │         └──→ generated/detector_yolo_angle/000001.txt
          │
-         └──→  Export → Export Target Maps (.npz)
+         └──→  Deprecated reference only: Export Target Maps (.npz)
                    └──→ generated/target_maps/000001/
-                            obj_001.png                         (ROI image)
+                            obj_001.png                         (legacy ROI image)
                             obj_001.npz   ← q_map, sin2θ, cos2θ, width
                             obj_001.json  ← metadata
 ```
 
 ---
 
-## Model A: Detection (YOLO format)
+## Model A V2: Detection + Orientation
 
 Each image gets one `.txt` file with one line per annotated object:
 
 ```
-class_id cx_norm cy_norm w_norm h_norm
+class_id cx_norm cy_norm w_norm h_norm sin2theta cos2theta yaw_valid angle_mask
 ```
 
 | Field | Description | Range |
@@ -203,14 +196,20 @@ class_id cx_norm cy_norm w_norm h_norm
 | `cy_norm` | Bbox center y / image height | [0, 1] |
 | `w_norm` | Bbox width / image width | [0, 1] |
 | `h_norm` | Bbox height / image height | [0, 1] |
+| `sin2theta` | `sin(2theta)` from VGA main-axis annotation | [-1, 1] |
+| `cos2theta` | `cos(2theta)` from VGA main-axis annotation | [-1, 1] |
+| `yaw_valid` | 1 only when `yaw_label_status == "valid"` | 0 or 1 |
+| `angle_mask` | 1 only when the sample participates in orientation loss | 0 or 1 |
 
-**Export**: `Export → Export YOLO Labels`  
-**Output**: `generated/detector_yolo/{camera}/{image_id}.txt`  
-**Compatible with**: YOLOv5/v8/v11, Ultralytics, any normalized-bbox detector.
+**Export**: `Export → Export YOLO-Angle Labels`
+**Output**: `generated/detector_yolo_angle/{camera}/{image_id}.txt`
+**Compatible with**: detector training code that consumes bbox plus `sin(2theta), cos(2theta)` orientation targets.
 
 ---
 
-## Model B: Grasp Prediction (Target Maps)
+## Deprecated Reference: Target Maps
+
+The old per-object target-map/ROI export is retained only for reference and migration. It is not part of the current Model A V2 firmware contract and must not be used to justify a separate Model B deployment path.
 
 Each graspable object produces one `.npz` file containing pixel-level supervision maps.
 
@@ -317,19 +316,14 @@ Each image gets one JSON file under `annotations/`:
       "instance_id": 1,
       "class_id": 0,
       "class_name": "phone_A",
+      "yaw_label_status": "valid",
+      "main_axis_points": [[245, 220], [355, 220]],
       "bbox_xyxy": [220, 160, 380, 300],
       "graspable": true,
       "policy": "grasp_rect",
-      "grasps": [
-        {
-          "grasp_id": 1,
-          "points": [[245, 220], [355, 220], [355, 245], [245, 245]],
-          "axis_convention": "p0_to_p1_is_grasp_width_axis",
-          "quality": 1.0,
-          "difficulty": "easy",
-          "note": ""
-        }
-      ]
+      "occlusion_level": 0,
+      "difficulty": "easy",
+      "note": ""
     }
   ]
 }
@@ -339,7 +333,7 @@ Each image gets one JSON file under `annotations/`:
 
 ## Validation
 
-- **Validate → Validate Current**: checks bbox bounds, grasp points, difficulty/quality values
+- **Validate → Validate Current**: checks bbox bounds, yaw status/main-axis consistency, occlusion, difficulty, and class-specific yaw requirements
 - **Validate → Validate All**: validates all annotations in the dataset
 
 ---
@@ -361,7 +355,7 @@ AssistiveGraspAnnotator/
       annotation.py          # ObjectAnnotation, GraspAnnotation, AnnotationModel
       dataset.py             # DatasetModel: open/create, scan, navigate
     ui/
-      image_canvas.py        # QGraphicsView: zoom/pan, bbox/grasp drawing, handles
+      image_canvas.py        # QGraphicsView: zoom/pan, bbox/main-axis drawing, handles
       side_panel.py          # Right panel: object/grasp lists, editors
       main_window.py         # MainWindow: menus, layout, shortcuts, signal wiring
       class_editor.py        # Class editor table + dialog
@@ -369,7 +363,8 @@ AssistiveGraspAnnotator/
     tools/
       geometry.py            # Pure geometry functions
       validators.py          # Annotation validation rules
-      export_yolo.py         # Model A: YOLO label export
+      export_yolo.py         # Legacy normalized bbox export
+      export_yolo_angle.py   # Model A V2: bbox + sin2theta/cos2theta export
       export_grasp_roi.py    # Grasp ROI crop + JSON export
-      export_target_maps.py  # Model B: .npz target map export
+      export_target_maps.py  # Deprecated reference: .npz target map export
 ```
