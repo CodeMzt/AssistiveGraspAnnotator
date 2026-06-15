@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { annotationReducer, qualityForDifficulty } from "./annotationReducer";
+import { annotationReducer } from "./annotationReducer";
 import type { Annotation, ClassInfo } from "./types";
 
-const cupClass: ClassInfo = { id: 7, name: "cup", graspable: true, policy: "grasp_rect" };
+const boxClass: ClassInfo = { id: 0, name: "phial", graspable: true };
 
 function baseAnnotation(): Annotation {
   return {
@@ -20,33 +20,36 @@ function baseAnnotation(): Annotation {
 function withObjects(): Annotation {
   let annotation = annotationReducer(baseAnnotation(), {
     type: "addObject",
-    classInfo: cupClass,
+    classInfo: boxClass,
     bbox: [10, 20, 110, 140]
   });
   annotation = annotationReducer(annotation, {
     type: "addObject",
-    classInfo: { ...cupClass, id: 9, name: "box" },
+    classInfo: { ...boxClass, id: 9, name: "earbud", graspable: false },
     bbox: [200, 220, 300, 340]
   });
   return annotation;
 }
 
 describe("annotationReducer", () => {
-  it("adds bbox objects with the selected class", () => {
+  it("adds bbox objects with default YOLO-Angle fields", () => {
     const annotation = annotationReducer(baseAnnotation(), {
       type: "addObject",
-      classInfo: cupClass,
+      classInfo: boxClass,
       bbox: [10, 20, 110, 140]
     });
 
     expect(annotation.objects).toHaveLength(1);
     expect(annotation.objects[0]).toMatchObject({
       instance_id: 1,
-      class_id: 7,
-      class_name: "cup",
+      class_id: 0,
+      class_name: "phial",
       bbox_xyxy: [10, 20, 110, 140],
       graspable: true,
-      policy: "grasp_rect"
+      yaw_label_status: "optional",
+      occlusion_level: 0,
+      difficulty: "easy",
+      notes: "",
     });
   });
 
@@ -55,77 +58,60 @@ describe("annotationReducer", () => {
 
     expect(annotation.objects).toHaveLength(1);
     expect(annotation.objects[0].instance_id).toBe(1);
-    expect(annotation.objects[0].class_name).toBe("box");
+    expect(annotation.objects[0].class_name).toBe("earbud");
   });
 
-  it("creates a four point grasp from three clicks", () => {
+  it("updates yaw label status", () => {
     const annotation = annotationReducer(withObjects(), {
-      type: "addGrasp",
+      type: "updateObjectYawStatus",
       instanceId: 1,
-      points: [
-        [20, 30],
-        [80, 30],
-        [80, 70]
-      ]
+      yawLabelStatus: "valid"
     });
-
-    expect(annotation.objects[0].grasps[0].points).toEqual([
-      [20, 30],
-      [80, 30],
-      [80, 70],
-      [20, 70]
-    ]);
+    expect(annotation.objects[0].yaw_label_status).toBe("valid");
   });
 
-  it("keeps p3 derived when editing grasp points", () => {
-    let annotation = annotationReducer(withObjects(), {
-      type: "addGrasp",
+  it("updates main axis points", () => {
+    const annotation = annotationReducer(withObjects(), {
+      type: "updateObjectMainAxis",
       instanceId: 1,
-      points: [
-        [20, 30],
-        [80, 30],
-        [80, 70]
-      ]
+      mainAxisPoints: [[20, 30], [80, 30]]
     });
-
-    annotation = annotationReducer(annotation, {
-      type: "updateGraspPoint",
-      instanceId: 1,
-      graspId: 1,
-      pointIndex: 1,
-      point: [90, 40]
-    });
-
-    expect(annotation.objects[0].grasps[0].points).toEqual([
-      [20, 30],
-      [90, 40],
-      [80, 70],
-      [10, 60]
-    ]);
+    expect(annotation.objects[0].main_axis_points).toEqual([[20, 30], [80, 30]]);
   });
 
-  it("maps difficulty changes to desktop quality defaults", () => {
-    expect(qualityForDifficulty("easy")).toBe(1);
-    expect(qualityForDifficulty("medium")).toBe(0.7);
-    expect(qualityForDifficulty("hard")).toBe(0.4);
-    expect(qualityForDifficulty("invalid")).toBe(0);
-
-    let annotation = annotationReducer(withObjects(), {
-      type: "addGrasp",
+  it("updates occlusion level", () => {
+    const annotation = annotationReducer(withObjects(), {
+      type: "updateObjectOcclusion",
       instanceId: 1,
-      points: [
-        [20, 30],
-        [80, 30],
-        [80, 70]
-      ]
+      occlusionLevel: 2
     });
-    annotation = annotationReducer(annotation, {
-      type: "updateGraspMetadata",
+    expect(annotation.objects[0].occlusion_level).toBe(2);
+  });
+
+  it("updates difficulty", () => {
+    const annotation = annotationReducer(withObjects(), {
+      type: "updateObjectDifficulty",
       instanceId: 1,
-      graspId: 1,
       difficulty: "hard"
     });
+    expect(annotation.objects[0].difficulty).toBe("hard");
+  });
 
-    expect(annotation.objects[0].grasps[0].quality).toBe(0.4);
+  it("updates notes", () => {
+    const annotation = annotationReducer(withObjects(), {
+      type: "updateObjectNotes",
+      instanceId: 1,
+      notes: "partially occluded"
+    });
+    expect(annotation.objects[0].notes).toBe("partially occluded");
+  });
+
+  it("updates template id", () => {
+    const annotation = annotationReducer(withObjects(), {
+      type: "updateObjectTemplate",
+      instanceId: 1,
+      templateId: "phial"
+    });
+    expect(annotation.objects[0].template_id).toBe("phial");
   });
 });

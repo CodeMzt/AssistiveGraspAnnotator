@@ -16,18 +16,14 @@ DIFFICULTIES = {"easy", "medium", "hard"}
 # Per-class yaw requirement hints
 # True = needs yaw, False = no yaw needed, None = conditional
 CLASS_YAW_REQUIRED: dict[str, bool | None] = {
-    "medicine_box_A": True,
-    "remote_A": True,
-    "tissue_pack_A": None,   # conditional — only if long/short sides differ clearly
-    "phone_A": True,
-    "bottle_A": False,
-    "cup_other": False,
-    "bottle_other": False,
-    "box_other": None,       # optional — for obstacle mapping only
-    "book": None,            # optional — recognition/obstacle only
-    "unknown_object": False,
+    "earbud": True,
+    "phial": False,
+    "bottle": False,
+    "phone": True,
+    "remote": True,
+    "tissue": None,
+    "apple": False,
 }
-
 
 @dataclass(frozen=True)
 class ValidationIssue:

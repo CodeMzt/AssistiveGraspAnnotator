@@ -284,7 +284,7 @@ Each .npz is accompanied by a `obj_{id}.json` with metadata:
   "scale": 1.071428,
   "instance_id": 1,
   "class_id": 0,
-  "class_name": "phone_A",
+  "class_name": "phone",
   "grasps": [
     {
       "grasp_id": 1,
@@ -315,7 +315,7 @@ Each image gets one JSON file under `annotations/`:
     {
       "instance_id": 1,
       "class_id": 0,
-      "class_name": "phone_A",
+      "class_name": "phone",
       "yaw_label_status": "valid",
       "main_axis_points": [[245, 220], [355, 220]],
       "bbox_xyxy": [220, 160, 380, 300],
@@ -368,3 +368,8 @@ AssistiveGraspAnnotator/
       export_grasp_roi.py    # Grasp ROI crop + JSON export
       export_target_maps.py  # Deprecated reference: .npz target map export
 ```
+
+## 2026-06-14 object_vocab_v1 alignment
+
+New datasets should use `examples/object_vocab_v1.json` and `examples/classes.yaml` with canonical target IDs `0 earbud`, `1 phial`, `2 bottle`, `3 phone`, `4 remote`, `5 tissue`, `6 apple`. Historical migration tools may still mention legacy cup aliases, but new annotations must not assign cup/small_cup_A/CUP as target classes.
+

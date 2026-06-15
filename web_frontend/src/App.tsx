@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { Lock } from "lucide-react";
-import { api } from "./api";
+import { ApiError, api } from "./api";
 import { annotationReducer, firstClass } from "./annotationReducer";
 import { AnnotationCanvas } from "./Canvas";
 import { DatasetPanel } from "./components/DatasetPanel";
@@ -13,14 +13,15 @@ import type {
   CanvasSelection,
   ClassInfo,
   DatasetMeta,
-  GraspAnnotation,
+  DatasetStats,
   ImageItem,
   LockInfo,
   Mode,
-  ValidationMessage
+  ValidationMessage,
+  YawLabelStatus
 } from "./types";
 
-const DEFAULT_CLASSES: ClassInfo[] = [{ id: 0, name: "object", graspable: true, policy: "grasp_rect" }];
+const DEFAULT_CLASSES: ClassInfo[] = [{ id: 0, name: "phial", graspable: true }];
 const UPLOAD_CHUNK_SIZE = 960 * 1024;
 const DEFAULT_UPLOAD_CONCURRENCY = 18;
 
@@ -51,6 +52,27 @@ function newUploadBatchId(): string {
 function uploadFileId(file: File, index: number): string {
   const safeName = file.name.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 80);
   return `f_${index}_${file.size}_${file.lastModified}_${safeName}`;
+}
+
+function normalizeDatasetRoot(root: string): string {
+  return root.replace(/\\/g, "/").replace(/\/+$/g, "").toLowerCase();
+}
+
+function resolveDatasetMeta(candidates: DatasetMeta[], current: DatasetMeta): DatasetMeta | null {
+  const byId = candidates.find((item) => item.dataset_id === current.dataset_id);
+  if (byId) return byId;
+  const currentRoot = normalizeDatasetRoot(current.root || "");
+  if (currentRoot) {
+    const byRoot = candidates.find((item) => normalizeDatasetRoot(item.root || "") === currentRoot);
+    if (byRoot) return byRoot;
+  }
+  return candidates.find((item) => item.name === current.name && !item.missing) || null;
+}
+
+function isNotFoundError(exc: unknown): boolean {
+  if (!(exc instanceof ApiError)) return false;
+  const text = `${exc.message} ${typeof exc.detail === "string" ? exc.detail : JSON.stringify(exc.detail ?? "")}`;
+  return exc.status === 404 || /not\s*found|unknown dataset/i.test(text);
 }
 
 async function runLimitedConcurrency<T>(items: T[], limit: number, worker: (item: T) => Promise<void>) {
@@ -93,17 +115,20 @@ export function App() {
   const [newDatasetName, setNewDatasetName] = useState("new_dataset");
   const [dataset, setDataset] = useState<DatasetMeta | null>(null);
   const [images, setImages] = useState<ImageItem[]>([]);
+  const [totalImages, setTotalImages] = useState(0);
   const [imageStatus, setImageStatus] = useState("all");
   const [selectedImage, setSelectedImage] = useState<ImageItem | null>(null);
   const [annotationState, dispatchAnnotationState] = useReducer(annotationStateReducer, { payload: null });
-  const [mode, setMode] = useState<Mode>("select");
-  const [selection, setSelection] = useState<CanvasSelection>({ objectId: null, graspId: null, handle: null });
+  const [mode, setMode] = useState<Mode>("bbox");
+  const [selection, setSelection] = useState<CanvasSelection>({ objectId: null, handle: null });
   const [lock, setLock] = useState<LockInfo | null>(null);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState("");
   const [statusLine, setStatusLine] = useState("");
   const [validationErrors, setValidationErrors] = useState<ValidationMessage[]>([]);
   const [validationWarnings, setValidationWarnings] = useState<ValidationMessage[]>([]);
+  const [stats, setStats] = useState<DatasetStats | null>(null);
+  const [statsLoading, setStatsLoading] = useState(false);
   const [jobMessage, setJobMessage] = useState("");
   const [uploadFiles, setUploadFiles] = useState<File[]>([]);
   const [uploadBatchId, setUploadBatchId] = useState("");
@@ -135,34 +160,37 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [lock?.lock_id, lock?.lock_token]);
 
+  const saveCurrentRef = useRef(saveCurrent);
+  saveCurrentRef.current = saveCurrent;
+  const deleteSelectionRef = useRef(deleteSelection);
+  deleteSelectionRef.current = deleteSelection;
+  const selectAdjacentImageRef = useRef(selectAdjacentImage);
+  selectAdjacentImageRef.current = selectAdjacentImage;
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.target as HTMLElement | null)?.matches("input, textarea, select")) return;
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
         event.preventDefault();
-        void saveCurrent();
+        void saveCurrentRef.current();
         return;
       }
       if (event.key === "Delete" || event.key === "Backspace") {
         event.preventDefault();
-        deleteSelection();
+        deleteSelectionRef.current();
       }
-      if (event.key.toLowerCase() === "n" || event.key === "ArrowRight") {
+      if (event.key.toLowerCase() === "n" || event.key === "ArrowRight" || event.key.toLowerCase() === "d") {
         event.preventDefault();
-        void selectAdjacentImage(1);
+        void selectAdjacentImageRef.current(1);
       }
-      if (event.key.toLowerCase() === "p" || event.key === "ArrowLeft") {
+      if (event.key.toLowerCase() === "p" || event.key === "ArrowLeft" || event.key.toLowerCase() === "a") {
         event.preventDefault();
-        void selectAdjacentImage(-1);
+        void selectAdjacentImageRef.current(-1);
       }
-      if (event.key === "1") updateSelectedDifficulty("easy");
-      if (event.key === "2") updateSelectedDifficulty("medium");
-      if (event.key === "3") updateSelectedDifficulty("hard");
-      if (event.key === "4") updateSelectedDifficulty("invalid");
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [annotation, selection, editable]);
+  }, []);
 
   function setPayload(next: AnnotationPayload | null) {
     dispatchAnnotationState({ type: "setPayload", payload: next });
@@ -208,7 +236,7 @@ export function App() {
       const data = await api.datasets();
       setDatasetList(data.datasets);
       if (dataset) {
-        const latest = data.datasets.find((item) => item.dataset_id === dataset.dataset_id);
+        const latest = resolveDatasetMeta(data.datasets, dataset);
         if (latest) setDataset(latest);
       }
     } catch (exc) {
@@ -223,25 +251,77 @@ export function App() {
       setPayload(saved);
       setDirty(false);
       setLock(null);
+      setError("");
       setValidationErrors(saved.validation?.errors || []);
       setValidationWarnings(saved.validation?.warnings || []);
+      setStats(null);
       setStatusLine("Saved");
       await loadImages();
       return true;
     } catch (exc) {
+      const validation = extractValidationResult(exc);
+      if (validation) {
+        setValidationErrors(validation.errors);
+        setValidationWarnings(validation.warnings);
+        setError("保存被校验拦截，请查看右侧 Validation 的修复建议。");
+        setStatusLine("Validation blocked save");
+        return false;
+      }
       setError(String((exc as Error).message || exc));
       return false;
     }
   }
 
+  function extractValidationResult(exc: unknown): { errors: ValidationMessage[]; warnings: ValidationMessage[] } | null {
+    if (!(exc instanceof ApiError)) return null;
+    const detail = exc.detail;
+    if (!detail || typeof detail !== "object" || !("validation" in detail)) return null;
+    const validation = (detail as { validation?: unknown }).validation;
+    if (!validation || typeof validation !== "object") return null;
+    const errors = (validation as { errors?: unknown }).errors;
+    const warnings = (validation as { warnings?: unknown }).warnings;
+    return {
+      errors: Array.isArray(errors) ? (errors as ValidationMessage[]) : [],
+      warnings: Array.isArray(warnings) ? (warnings as ValidationMessage[]) : []
+    };
+  }
+
+  async function refreshStats(meta = dataset) {
+    if (!meta || statsLoading) return;
+    setStatsLoading(true);
+    setError("");
+    try {
+      setStatusLine("Refreshing dataset registry...");
+      const catalog = await api.datasets();
+      setDatasetList(catalog.datasets);
+      const resolved = resolveDatasetMeta(catalog.datasets, meta);
+      if (!resolved) {
+        throw new Error(`当前数据集不在后端列表中，无法刷新统计：${meta.name} (${meta.root})`);
+      }
+      if (resolved.missing) {
+        throw new Error(`当前数据集目录不存在，无法刷新统计：${resolved.root}`);
+      }
+      if (resolved.dataset_id !== meta.dataset_id) {
+        setDataset(resolved);
+        setStatusLine("Dataset id refreshed; loading statistics...");
+      }
+      const next = await api.stats(resolved.dataset_id);
+      setStats(next);
+      setStatusLine(`统计已刷新：${next.dataset.object_count} 个目标框，${next.dataset.axis_count} 个主轴标注`);
+    } catch (exc) {
+      if (isNotFoundError(exc)) {
+        setError("统计刷新返回 NotFound：通常是浏览器连接到了旧版 Web 服务，或当前数据集 id 已失效。请重新点一次数据集下拉项；如果仍出现，重启 start_web.bat 后刷新浏览器。");
+      } else {
+        setError(String((exc as Error).message || exc));
+      }
+    } finally {
+      setStatsLoading(false);
+    }
+  }
+
   async function ensureCleanBeforeSwitch(): Promise<boolean> {
     if (!dirty) return true;
-    if (!editable || !lock) {
-      setError("Current image has unsaved changes. Save or release them before switching.");
-      return false;
-    }
-    const wantsSave = window.confirm("Save current annotation before switching?");
-    if (!wantsSave) return false;
+    if (!editable || !lock) return true;
     return saveCurrent();
   }
 
@@ -249,6 +329,7 @@ export function App() {
     if (!meta) return;
     const data = await api.images(meta.dataset_id, status);
     setImages(data.items);
+    setTotalImages(data.total);
   }
 
   async function selectDataset(datasetId: string) {
@@ -262,9 +343,10 @@ export function App() {
     await releaseCurrentLock();
     const meta = await api.dataset(datasetId);
     setDataset(meta);
+    setStats(null);
     setSelectedImage(null);
     setPayload(null);
-    setSelection({ objectId: null, graspId: null, handle: null });
+    setSelection({ objectId: null, handle: null });
     setValidationErrors([]);
     setValidationWarnings([]);
     setDirty(false);
@@ -280,9 +362,10 @@ export function App() {
     try {
       const meta = await api.createDataset(name, DEFAULT_CLASSES);
       setDataset(meta);
+      setStats(null);
       setSelectedImage(null);
       setPayload(null);
-      setSelection({ objectId: null, graspId: null, handle: null });
+      setSelection({ objectId: null, handle: null });
       setDirty(false);
       setImages([]);
       setNewDatasetName("new_dataset");
@@ -319,10 +402,11 @@ export function App() {
       const deletedName = dataset.name;
       await api.deleteDataset(dataset.dataset_id);
       setDataset(null);
+      setStats(null);
       setSelectedImage(null);
       setPayload(null);
       setImages([]);
-      setSelection({ objectId: null, graspId: null, handle: null });
+      setSelection({ objectId: null, handle: null });
       setDirty(false);
       await loadDatasetCatalog();
       setStatusLine(`Deleted ${deletedName}`);
@@ -440,9 +524,10 @@ export function App() {
       }
       setUploadProgress(100);
       setDataset(meta);
+      setStats(null);
       setSelectedImage(null);
       setPayload(null);
-      setSelection({ objectId: null, graspId: null, handle: null });
+      setSelection({ objectId: null, handle: null });
       setDirty(false);
       setUploadFiles([]);
       setUploadBatchId("");
@@ -465,6 +550,7 @@ export function App() {
     try {
       const meta = await api.updateClasses(dataset.dataset_id, dataset.classes);
       setDataset(meta);
+      setStats(null);
       setDatasetList((current) => current.map((item) => (item.dataset_id === meta.dataset_id ? meta : item)));
       setStatusLine("Classes saved");
     } catch (exc) {
@@ -484,12 +570,13 @@ export function App() {
     try {
       const result = await api.deleteImage(dataset.dataset_id, item.image_id);
       setDataset(result.dataset);
+      setStats(null);
       setDatasetList((current) => current.map((entry) => (entry.dataset_id === result.dataset.dataset_id ? result.dataset : entry)));
       if (selectedImage?.image_id === item.image_id) {
         await releaseCurrentLock();
         setSelectedImage(null);
         setPayload(null);
-        setSelection({ objectId: null, graspId: null, handle: null });
+        setSelection({ objectId: null, handle: null });
       }
       const data = await api.images(dataset.dataset_id, imageStatus);
       setImages(data.items);
@@ -522,6 +609,7 @@ export function App() {
       }
     }
     setDataset(latestDataset);
+    setStats(null);
     setDatasetList((current) =>
       current.map((entry) => (entry.dataset_id === latestDataset.dataset_id ? latestDataset : entry))
     );
@@ -529,7 +617,7 @@ export function App() {
       await releaseCurrentLock();
       setSelectedImage(null);
       setPayload(null);
-      setSelection({ objectId: null, graspId: null, handle: null });
+      setSelection({ objectId: null, handle: null });
     }
     const data = await api.images(dataset.dataset_id, imageStatus);
     setImages(data.items);
@@ -544,7 +632,7 @@ export function App() {
     await releaseCurrentLock();
     setSelectedImage(item);
     setPayload(null);
-    setSelection({ objectId: null, graspId: null, handle: null });
+    setSelection({ objectId: null, handle: null });
     setValidationErrors([]);
     setValidationWarnings([]);
     setStatusLine("");
@@ -552,7 +640,14 @@ export function App() {
     const next = await api.annotation(dataset.dataset_id, item.image_id);
     setPayload(next);
     setDirty(false);
-    setLock(null);
+    setMode("bbox");
+    try {
+      const acquiredLock = await api.lock(dataset.dataset_id, item.image_id);
+      setLock(acquiredLock);
+      setStatusLine("Editing");
+    } catch (exc) {
+      setError(String((exc as Error).message || exc));
+    }
   }
 
   async function selectAdjacentImage(delta: number) {
@@ -586,17 +681,8 @@ export function App() {
 
   function deleteSelection() {
     if (!editable || !selection.objectId) return;
-    if (selection.graspId) {
-      dispatchAnnotation({ type: "deleteGrasp", instanceId: selection.objectId, graspId: selection.graspId });
-    } else {
-      dispatchAnnotation({ type: "deleteObject", instanceId: selection.objectId });
-    }
-    setSelection({ objectId: null, graspId: null, handle: null });
-  }
-
-  function updateSelectedDifficulty(difficulty: GraspAnnotation["difficulty"]) {
-    if (!editable || !selection.objectId || !selection.graspId) return;
-    dispatchAnnotation({ type: "updateGraspMetadata", instanceId: selection.objectId, graspId: selection.graspId, difficulty });
+    dispatchAnnotation({ type: "deleteObject", instanceId: selection.objectId });
+    setSelection({ objectId: null, handle: null });
   }
 
   async function validateCurrent() {
@@ -607,15 +693,21 @@ export function App() {
     setStatusLine(result.valid ? "Validation passed" : "Validation issues");
   }
 
-  async function exportDataset(exportType: "yolo" | "grasp_roi" | "target_maps") {
+  async function exportDataset(exportType: "yolo" | "yolo_angle" | "obb_teacher") {
     if (!dataset) return;
     if (dirty && !(await saveCurrent())) return;
-    setJobMessage("Export queued");
+    setJobMessage("Export queued...");
     const job = await api.exportDataset(dataset.dataset_id, exportType);
     const timer = window.setInterval(async () => {
       const latest = await api.job(job.id);
       setJobMessage(`${latest.status}: ${latest.message || exportType}`);
-      if (!["queued", "running"].includes(latest.status)) window.clearInterval(timer);
+      if (latest.status === "done" || latest.status === "done_with_errors") {
+        window.clearInterval(timer);
+        setJobMessage("Download starting...");
+        window.location.href = `/api/jobs/${job.id}/download`;
+      } else if (latest.status === "failed") {
+        window.clearInterval(timer);
+      }
     }, 1000);
   }
 
@@ -644,6 +736,7 @@ export function App() {
         newDatasetName={newDatasetName}
         dataset={dataset}
         images={images}
+        totalImages={totalImages}
         imageStatus={imageStatus}
         selectedImageId={selectedImage?.image_id || null}
         uploadFiles={uploadFiles}
@@ -651,6 +744,8 @@ export function App() {
         uploadProgress={uploadProgress}
         uploadMessage={uploadMessage}
         uploadConcurrency={uploadConcurrency}
+        stats={stats}
+        statsLoading={statsLoading}
         onNewDatasetNameChange={setNewDatasetName}
         onCreateDataset={() => void createDataset()}
         onSelectDataset={(datasetId) => void selectDataset(datasetId)}
@@ -668,6 +763,7 @@ export function App() {
         onUploadFilesChange={handleUploadFilesChange}
         onUploadConcurrencyChange={handleUploadConcurrencyChange}
         onUploadDataset={() => void uploadDataset()}
+        onRefreshStats={() => void refreshStats()}
         onDeleteImage={(image) => void deleteImage(image)}
         onDeleteImages={(selectedImages) => void deleteImages(selectedImages)}
       />
@@ -694,10 +790,11 @@ export function App() {
           mode={mode}
           editable={editable}
           selection={selection}
+          classes={dataset?.classes || []}
           onSelectionChange={setSelection}
           onModeChange={setMode}
           onAction={dispatchAnnotation}
-          onNoObjectForGrasp={() => setStatusLine("Draw a bbox first, then select it before drawing grasps")}
+          onNoObjectForAxis={() => setStatusLine("Draw a bbox first, then select it before drawing the axis")}
           defaultClassAction={defaultClassAction}
         />
       </section>
@@ -715,16 +812,23 @@ export function App() {
         onClassChange={(instanceId: number, classInfo: ClassInfo) =>
           dispatchAnnotation({ type: "updateObjectClass", instanceId, classInfo })
         }
-        onDifficultyChange={(instanceId, graspId, difficulty) =>
-          dispatchAnnotation({ type: "updateGraspMetadata", instanceId, graspId, difficulty })
+        onYawStatusChange={(instanceId, status) =>
+          dispatchAnnotation({ type: "updateObjectYawStatus", instanceId, yawLabelStatus: status })
         }
-        onQualityChange={(instanceId, graspId, quality) =>
-          dispatchAnnotation({ type: "updateGraspMetadata", instanceId, graspId, quality })
+        onOcclusionChange={(instanceId, level) =>
+          dispatchAnnotation({ type: "updateObjectOcclusion", instanceId, occlusionLevel: level })
         }
-        onNoteChange={(instanceId, graspId, note) =>
-          dispatchAnnotation({ type: "updateGraspMetadata", instanceId, graspId, note })
+        onDifficultyChange={(instanceId, difficulty) =>
+          dispatchAnnotation({ type: "updateObjectDifficulty", instanceId, difficulty })
+        }
+        onTemplateChange={(instanceId, templateId) =>
+          dispatchAnnotation({ type: "updateObjectTemplate", instanceId, templateId })
+        }
+        onNotesChange={(instanceId, notes) =>
+          dispatchAnnotation({ type: "updateObjectNotes", instanceId, notes })
         }
         onExport={(exportType) => void exportDataset(exportType)}
+        onDeleteImage={() => { if (selectedImage) void deleteImage(selectedImage); }}
       />
     </main>
   );
