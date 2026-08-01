@@ -15,9 +15,7 @@
         315
       ],
       "template_id": "phone",
-      "graspable": true,
-      "policy": "grasp_rect",
-      "grasps": []
+      "graspable": true
     },
     {
       "instance_id": 2,
@@ -30,9 +28,7 @@
         330
       ],
       "template_id": "apple",
-      "graspable": true,
-      "policy": "center_or_grasp_rect",
-      "grasps": []
+      "graspable": true
     }
   ]
 }

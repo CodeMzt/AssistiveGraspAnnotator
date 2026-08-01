@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import shutil
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
 from fastapi import (
     BackgroundTasks,
@@ -22,12 +26,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from assistive_grasp_annotator.tools.export_grasp_roi import export_grasp_rois
-from assistive_grasp_annotator.tools.export_target_maps import export_target_maps
+from assistive_grasp_annotator.tools.export_obb_teacher import export_obb_teacher_labels
 from assistive_grasp_annotator.tools.export_yolo import export_yolo_labels
+from assistive_grasp_annotator.tools.export_yolo_angle import export_yolo_angle_labels
 from assistive_grasp_annotator.tools.validators import validate_annotation
-from assistive_grasp_annotator.web.config import WebConfig, resolve_allowed_path
-from assistive_grasp_annotator.web.datasets import DatasetError, DatasetService
+from assistive_grasp_annotator.web.config import WebConfig
+from assistive_grasp_annotator.web.datasets import DatasetError, DatasetService, DatasetValidationError, MaskGenerationError
 from assistive_grasp_annotator.web.ids import decode_image_id
 from assistive_grasp_annotator.web.schemas import (
     ClassesRequest,
@@ -37,6 +41,7 @@ from assistive_grasp_annotator.web.schemas import (
     ExportRequest,
     HeartbeatRequest,
     LoginRequest,
+    MaskReviewRequest,
     OpenDatasetRequest,
     RenameDatasetRequest,
     ReleaseLockRequest,
@@ -45,6 +50,15 @@ from assistive_grasp_annotator.web.schemas import (
 )
 from assistive_grasp_annotator.web.state import StateStore
 from assistive_grasp_annotator.web.uploads import ChunkUploadService, UploadError
+
+
+USER_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30
+
+
+def _decode_user_value(value: str | None) -> str:
+    if not value:
+        return ""
+    return unquote(value).strip()
 
 
 def create_app(config: WebConfig | None = None) -> FastAPI:
@@ -62,12 +76,7 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-            "http://localhost:8000",
-            "http://127.0.0.1:8000",
-        ],
+        allow_origin_regex=r"https?://.*",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -77,7 +86,7 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
         aga_user: str | None = Cookie(default=None),
         x_aga_user: str | None = Header(default=None),
     ) -> str:
-        user = (aga_user or x_aga_user or "").strip()
+        user = _decode_user_value(x_aga_user) or _decode_user_value(aga_user)
         if not user:
             raise HTTPException(status_code=401, detail="Login required")
         return user
@@ -99,7 +108,13 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
         username = payload.username.strip()
         if not username:
             raise HTTPException(status_code=422, detail="username is required")
-        response.set_cookie("aga_user", username, httponly=False, samesite="lax")
+        response.set_cookie(
+            "aga_user",
+            quote(username),
+            httponly=False,
+            samesite="lax",
+            max_age=USER_COOKIE_MAX_AGE_SECONDS,
+        )
         return {"username": username}
 
     @app.get("/api/roots")
@@ -199,6 +214,11 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
         row, dataset = dataset_or_404(dataset_id)
         return dataset.metadata(dataset_id, row["source"], row["name"])
 
+    @app.get("/api/datasets/{dataset_id}/stats")
+    def dataset_stats(dataset_id: str) -> dict[str, Any]:
+        _, dataset = dataset_or_404(dataset_id)
+        return dataset.stats()
+
     @app.patch("/api/datasets/{dataset_id}")
     def rename_dataset(
         dataset_id: str,
@@ -244,13 +264,15 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         _, dataset = dataset_or_404(dataset_id)
         entries = dataset.list_images(status)
-        limit = max(1, min(limit, 500))
+        limit = max(1, min(limit, 5000))
         offset = max(0, offset)
         page = entries[offset : offset + limit]
-        items = []
-        for entry in page:
-            lock = store.lock_for_image(dataset_id, entry.image_id)
-            items.append(entry.to_dict(lock.public_dict() if lock else None))
+        image_ids = [entry.image_id for entry in page]
+        locks = store.locks_for_images(dataset_id, image_ids)
+        items = [
+            entry.to_dict((lock.public_dict() if (lock := locks.get(entry.image_id)) else None))
+            for entry in page
+        ]
         return {"items": items, "total": len(entries), "offset": offset, "limit": limit}
 
     @app.post("/api/datasets/{dataset_id}/images/upload")
@@ -275,6 +297,7 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
                 store.finish_upload_batch(batch_scope, upload_batch_id, "failed", {}, str(exc))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         store.log_audit(dataset_id, None, user, "upload_images", {"files": copied})
+        datasets.clear_cache_for(dataset.root)
         result = {
             "added": copied,
             "dataset": dataset.metadata(dataset_id, row["source"], row["name"]),
@@ -331,6 +354,71 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
         payload["lock"] = lock.public_dict() if lock else None
         return payload
 
+    @app.get("/api/datasets/{dataset_id}/images/{image_id}/mask-review")
+    def get_mask_review(dataset_id: str, image_id: str) -> dict[str, Any]:
+        _, dataset = dataset_or_404(dataset_id)
+        try:
+            return dataset.mask_review_payload(image_id)
+        except DatasetError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/datasets/{dataset_id}/images/{image_id}/objects/{instance_id}/mask-candidate")
+    def create_mask_candidate(
+        dataset_id: str,
+        image_id: str,
+        instance_id: int,
+        user: str = Depends(current_user),
+    ) -> dict[str, Any]:
+        _, dataset = dataset_or_404(dataset_id)
+        try:
+            candidate = dataset.generate_mask_candidate(image_id, instance_id)
+        except MaskGenerationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except DatasetError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        store.log_audit(dataset_id, image_id, user, "generate_mask_candidate", {"instance_id": instance_id})
+        return candidate
+
+    @app.put("/api/datasets/{dataset_id}/images/{image_id}/objects/{instance_id}/mask-review")
+    def save_mask_review(
+        dataset_id: str,
+        image_id: str,
+        instance_id: int,
+        payload: MaskReviewRequest,
+        user: str = Depends(current_user),
+    ) -> dict[str, Any]:
+        _, dataset = dataset_or_404(dataset_id)
+        try:
+            review = dataset.save_mask_review(image_id, instance_id, user, payload.model_dump())
+        except DatasetError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        store.log_audit(dataset_id, image_id, user, "save_mask_review", {"instance_id": instance_id, "score": review["score"]})
+        return review
+
+    @app.delete("/api/datasets/{dataset_id}/images/{image_id}/objects/{instance_id}/mask-review")
+    def clear_mask_review(
+        dataset_id: str,
+        image_id: str,
+        instance_id: int,
+        user: str = Depends(current_user),
+    ) -> dict[str, Any]:
+        _, dataset = dataset_or_404(dataset_id)
+        try:
+            cleared = dataset.clear_mask_review(image_id, instance_id)
+        except DatasetError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        store.log_audit(dataset_id, image_id, user, "clear_mask_review", {"instance_id": instance_id})
+        return cleared
+
+    @app.get("/api/datasets/{dataset_id}/images/{image_id}/objects/{instance_id}/mask-candidate/preview")
+    def mask_candidate_preview(dataset_id: str, image_id: str, instance_id: int) -> FileResponse:
+        _, dataset = dataset_or_404(dataset_id)
+        try:
+            path = dataset.mask_candidate_preview_path(image_id, instance_id)
+        except DatasetError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return FileResponse(path, media_type="image/png")
+
     @app.delete("/api/datasets/{dataset_id}/images/{image_id}")
     def delete_image(dataset_id: str, image_id: str, user: str = Depends(current_user)) -> dict[str, Any]:
         row, dataset = dataset_or_404(dataset_id)
@@ -358,6 +446,8 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=423, detail="A valid edit lock is required")
         try:
             saved = dataset.save_annotation(image_id, payload.annotation, payload.etag)
+        except DatasetValidationError as exc:
+            raise HTTPException(status_code=400, detail={"validation": {"valid": False, **exc.validation}}) from exc
         except DatasetError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         store.release_lock(payload.lock_id, payload.lock_token, user)
@@ -412,40 +502,75 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
             key = dataset._make_image_key(path)
             report = dataset.validate_annotation_payload(path)
             for err in report["errors"]:
-                errors.append({"image_key": key, "message": err})
+                errors.append({**err, "image_key": err.get("image_key", key)})
             for warning in report["warnings"]:
-                warnings.append({"image_key": key, "message": warning})
+                warnings.append({**warning, "image_key": warning.get("image_key", key)})
         return {"valid": not errors, "errors": errors, "warnings": warnings}
 
-    def run_export_job(job_id: str, dataset_id: str, export_type: str, output_dir: str | None, map_size: int) -> None:
+    def cleanup_export_files(temp_dir: Path) -> None:
         try:
-            _, dataset = datasets.get_dataset(dataset_id)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    STORE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".npz"}
+
+    def _zip_compress_type(filepath: Path) -> int:
+        return zipfile.ZIP_STORED if filepath.suffix.lower() in STORE_EXTENSIONS else zipfile.ZIP_DEFLATED
+
+    def run_export_job(job_id: str, dataset_id: str, export_type: str, map_size: int) -> None:
+        _, dataset_dataset = datasets.get_dataset(dataset_id)
+        dataset_name = dataset_dataset.root.name
+        tmp_dir = Path(tempfile.mkdtemp(prefix=f"aga_export_{export_type}_"))
+        try:
             store.update_job(job_id, "running", "Export running")
-            if output_dir:
-                out_dir = resolve_allowed_path(output_dir, [dataset.root, config.upload_root])
-            elif export_type == "yolo":
-                out_dir = dataset.root / "generated" / "detector_yolo"
-            elif export_type == "grasp_roi":
-                out_dir = dataset.root / "generated" / "grasp_roi"
-            else:
-                out_dir = dataset.root / "generated" / "target_maps"
 
             if export_type == "yolo":
-                exported, errors = export_yolo_labels(dataset, out_dir)
-            elif export_type == "grasp_roi":
-                exported, errors = export_grasp_rois(dataset, out_dir)
-            elif export_type == "target_maps":
-                exported, errors = export_target_maps(dataset, out_dir, map_size=map_size)
+                exported, errors = export_yolo_labels(dataset_dataset, tmp_dir)
+            elif export_type == "yolo_angle":
+                exported, errors = export_yolo_angle_labels(dataset_dataset, tmp_dir)
+            elif export_type == "obb_teacher":
+                exported, errors = export_obb_teacher_labels(dataset_dataset, tmp_dir)
             else:
                 raise ValueError(f"Unsupported export type: {export_type}")
+
+            zip_filename = f"{dataset_name}_{export_type}.zip"
+            zip_path = tmp_dir / zip_filename
+            arc_root = f"{dataset_name}_{export_type}"
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                # 1. Add export output files from temp dir
+                for file_path in tmp_dir.rglob("*"):
+                    if file_path.is_file() and file_path != zip_path:
+                        arcname = f"{arc_root}/{file_path.relative_to(tmp_dir)}"
+                        zf.write(file_path, arcname, _zip_compress_type(file_path))
+
+                # 2. Add original images (directly from source, no copy)
+                image_arc_root = f"{arc_root}/images"
+                for img_path in dataset_dataset.image_paths:
+                    image_key = dataset_dataset._make_image_key(img_path)
+                    zf.write(
+                        img_path,
+                        f"{image_arc_root}/{image_key}",
+                        _zip_compress_type(img_path),
+                    )
+
+                # 3. Add classes.yaml if it exists
+                if dataset_dataset.classes_path and dataset_dataset.classes_path.exists():
+                    zf.write(
+                        dataset_dataset.classes_path,
+                        f"{arc_root}/classes.yaml",
+                        zipfile.ZIP_DEFLATED,
+                    )
+
             status = "done" if errors == 0 else "done_with_errors"
             store.update_job(
                 job_id,
                 status,
                 f"Exported {exported} item(s), {errors} error(s)",
-                {"exported": exported, "errors": errors, "output_dir": str(out_dir)},
+                {"exported": exported, "errors": errors, "zip_path": str(zip_path)},
             )
         except Exception as exc:
+            cleanup_export_files(tmp_dir)
             store.update_job(job_id, "failed", str(exc), {})
 
     @app.post("/api/datasets/{dataset_id}/exports")
@@ -463,7 +588,6 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
             job["id"],
             dataset_id,
             payload.export_type,
-            payload.output_dir,
             payload.map_size,
         )
         return job
@@ -474,6 +598,36 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         return job
+
+    @app.get("/api/jobs/{job_id}/download")
+    def download_job_export(
+        job_id: str,
+        background_tasks: BackgroundTasks,
+    ) -> FileResponse:
+        job = store.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job["status"] not in ("done", "done_with_errors"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job status is '{job['status']}', must be 'done' or 'done_with_errors'",
+            )
+        result = job.get("result") or {}
+        zip_path_str = result.get("zip_path")
+        if not zip_path_str:
+            raise HTTPException(status_code=404, detail="No export file for this job")
+        zip_path = Path(zip_path_str)
+        if not zip_path.exists():
+            raise HTTPException(status_code=404, detail="Export file already cleaned up")
+
+        background_tasks.add_task(cleanup_export_files, zip_path.parent)
+
+        filename = f"{job.get('job_type', 'export')}.zip"
+        return FileResponse(
+            path=zip_path,
+            media_type="application/zip",
+            filename=filename,
+        )
 
     dist = config.frontend_dist
     assets_dir = dist / "assets"

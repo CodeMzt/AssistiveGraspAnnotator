@@ -1,4 +1,28 @@
-import type { Annotation, AnnotationPayload, ClassInfo, DatasetMeta, ImageItem, LockInfo, ValidationResult } from "./types";
+import type {
+  Annotation,
+  AnnotationPayload,
+  ClassInfo,
+  DatasetMeta,
+  DatasetStats,
+  ImageItem,
+  LockInfo,
+  MaskCandidate,
+  MaskReview,
+  MaskReviewPayload,
+  ValidationResult
+} from "./types";
+
+export class ApiError extends Error {
+  detail: unknown;
+  status: number;
+
+  constructor(message: string, detail: unknown, status = 0) {
+    super(message);
+    this.name = "ApiError";
+    this.detail = detail;
+    this.status = status;
+  }
+}
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
@@ -6,20 +30,54 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     credentials: "include",
     headers: {
       ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+      ...authHeaders(),
       ...(options.headers || {})
     }
   });
   if (!response.ok) {
     let detail = response.statusText;
+    let rawDetail: unknown = detail;
     try {
-      const data = await response.json();
-      detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+      const text = await response.text();
+      try {
+        const data = JSON.parse(text);
+        rawDetail = data.detail ?? data;
+        detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+      } catch {
+        rawDetail = text || response.statusText;
+        detail = text || response.statusText;
+      }
     } catch {
-      detail = await response.text();
+      detail = response.statusText;
+      rawDetail = detail;
     }
-    throw new Error(detail || `HTTP ${response.status}`);
+    throw new ApiError(detail || `HTTP ${response.status}`, rawDetail, response.status);
   }
   return response.json() as Promise<T>;
+}
+
+function storedAuthUser(): string {
+  if (typeof localStorage === "undefined") return "";
+  try {
+    return (localStorage.getItem("aga_user") || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function authHeaderValue(): string {
+  const user = storedAuthUser();
+  if (!user) return "";
+  try {
+    return encodeURIComponent(user);
+  } catch {
+    return "";
+  }
+}
+
+function authHeaders(): Record<string, string> {
+  const user = authHeaderValue();
+  return user ? { "X-AGA-User": user } : {};
 }
 
 function uploadRequest<T>(path: string, form: FormData, onProgress?: (progress: number) => void): Promise<T> {
@@ -27,6 +85,10 @@ function uploadRequest<T>(path: string, form: FormData, onProgress?: (progress: 
     const xhr = new XMLHttpRequest();
     xhr.open("POST", path);
     xhr.withCredentials = true;
+    const user = authHeaderValue();
+    if (user) {
+      xhr.setRequestHeader("X-AGA-User", user);
+    }
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable || !onProgress) return;
       onProgress(Math.round((event.loaded / event.total) * 100));
@@ -138,15 +200,18 @@ export const api = {
   dataset(datasetId: string) {
     return request<DatasetMeta>(`/api/datasets/${datasetId}`);
   },
+  stats(datasetId: string) {
+    return request<DatasetStats>(`/api/datasets/${datasetId}/stats`);
+  },
   updateClasses(datasetId: string, classes: ClassInfo[]) {
     return request<DatasetMeta>(`/api/datasets/${datasetId}/classes`, {
       method: "PUT",
       body: JSON.stringify({ classes })
     });
   },
-  images(datasetId: string, status = "all") {
-    return request<{ items: ImageItem[]; total: number }>(
-      `/api/datasets/${datasetId}/images?limit=500&status=${encodeURIComponent(status)}`
+  images(datasetId: string, status = "all", offset = 0, limit = 320) {
+    return request<{ items: ImageItem[]; total: number; offset: number; limit: number }>(
+      `/api/datasets/${datasetId}/images?offset=${offset}&limit=${limit}&status=${encodeURIComponent(status)}`
     );
   },
   annotation(datasetId: string, imageId: string) {
@@ -186,6 +251,38 @@ export const api = {
       })
     });
   },
+  maskReview(datasetId: string, imageId: string) {
+    return request<MaskReviewPayload>(`/api/datasets/${datasetId}/images/${imageId}/mask-review`);
+  },
+  generateMaskCandidate(datasetId: string, imageId: string, instanceId: number) {
+    return request<MaskCandidate>(
+      `/api/datasets/${datasetId}/images/${imageId}/objects/${instanceId}/mask-candidate`,
+      { method: "POST" }
+    );
+  },
+  saveMaskReview(
+    datasetId: string,
+    imageId: string,
+    instanceId: number,
+    payload: { candidate_id?: string | null; score: number; review_status?: string | null; failure_tags?: string[]; notes?: string }
+  ) {
+    return request<MaskReview>(
+      `/api/datasets/${datasetId}/images/${imageId}/objects/${instanceId}/mask-review`,
+      {
+        method: "PUT",
+        body: JSON.stringify(payload)
+      }
+    );
+  },
+  clearMaskReview(datasetId: string, imageId: string, instanceId: number) {
+    return request<{ cleared: boolean; instance_id: number }>(
+      `/api/datasets/${datasetId}/images/${imageId}/objects/${instanceId}/mask-review`,
+      { method: "DELETE" }
+    );
+  },
+  maskPreviewUrl(datasetId: string, imageId: string, instanceId: number) {
+    return `/api/datasets/${datasetId}/images/${imageId}/objects/${instanceId}/mask-candidate/preview`;
+  },
   validate(datasetId: string, imageId?: string) {
     return request<ValidationResult>(
       `/api/datasets/${datasetId}/validate`,
@@ -195,7 +292,7 @@ export const api = {
       }
     );
   },
-  exportDataset(datasetId: string, exportType: "yolo" | "grasp_roi" | "target_maps") {
+  exportDataset(datasetId: string, exportType: "yolo" | "yolo_angle" | "obb_teacher") {
     return request<{ id: string; status: string }>(`/api/datasets/${datasetId}/exports`, {
       method: "POST",
       body: JSON.stringify({ export_type: exportType })

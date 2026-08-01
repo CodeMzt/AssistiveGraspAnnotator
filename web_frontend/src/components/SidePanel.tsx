@@ -4,6 +4,8 @@ import type {
   CanvasSelection,
   ClassInfo,
   DatasetMeta,
+  MaskCandidate,
+  MaskReview,
   ValidationMessage,
   YawLabelStatus
 } from "../types";
@@ -17,6 +19,11 @@ type Props = {
   validationErrors: ValidationMessage[];
   validationWarnings: ValidationMessage[];
   jobMessage: string;
+  maskCandidate: MaskCandidate | null;
+  maskReview: MaskReview | null;
+  maskBusy: boolean;
+  maskOverlayVisible: boolean;
+  maskFailureTags: string[];
   onSelectionChange: (selection: CanvasSelection) => void;
   onClassChange: (instanceId: number, classInfo: ClassInfo) => void;
   onYawStatusChange: (instanceId: number, status: YawLabelStatus) => void;
@@ -26,6 +33,12 @@ type Props = {
   onNotesChange: (instanceId: number, notes: string) => void;
   onExport: (exportType: "yolo" | "yolo_angle" | "obb_teacher") => void;
   onDeleteImage: () => void;
+  onGenerateMaskCandidate: () => void;
+  onMaskScore: (score: number) => void;
+  onMaskOverlayToggle: () => void;
+  onMaskFailureTagsChange: (instanceId: number, tags: string[]) => void;
+  onMaskNotesChange: (instanceId: number, notes: string) => void;
+  onClearMaskReview: () => void;
 };
 
 const YAW_STATUS_OPTIONS: { value: YawLabelStatus; label: string }[] = [
@@ -58,6 +71,11 @@ export function SidePanel({
   validationErrors,
   validationWarnings,
   jobMessage,
+  maskCandidate,
+  maskReview,
+  maskBusy,
+  maskOverlayVisible,
+  maskFailureTags,
   onSelectionChange,
   onClassChange,
   onYawStatusChange,
@@ -66,7 +84,13 @@ export function SidePanel({
   onTemplateChange,
   onNotesChange,
   onExport,
-  onDeleteImage
+  onDeleteImage,
+  onGenerateMaskCandidate,
+  onMaskScore,
+  onMaskOverlayToggle,
+  onMaskFailureTagsChange,
+  onMaskNotesChange,
+  onClearMaskReview
 }: Props) {
   const selectedObject = annotation?.objects.find((obj) => obj.instance_id === selection.objectId) || null;
   const axisCount = annotation ? annotation.objects.filter((obj) => obj.main_axis_points && obj.main_axis_points.length === 2).length : 0;
@@ -208,6 +232,89 @@ export function SidePanel({
             onChange={(event) => onNotesChange(selectedObject.instance_id, event.target.value)}
             rows={3}
             placeholder="e.g. partially occluded, edge case"
+          />
+        </section>
+      )}
+
+      {selectedObject && (
+        <section>
+          <div className="section-title">Mask / Smooth Contour Review</div>
+          <div className="mask-review-actions">
+            <button disabled={maskBusy} onClick={onGenerateMaskCandidate}>
+              Generate SAM (G)
+            </button>
+            <button disabled={!maskCandidate} onClick={onMaskOverlayToggle}>
+              {maskOverlayVisible ? "Hide Overlay (O)" : "Show Overlay (O)"}
+            </button>
+            <button disabled={maskBusy || !maskReview} onClick={onClearMaskReview}>
+              Reset (R)
+            </button>
+          </div>
+          {maskCandidate ? (
+            <dl className="info-grid mask-info-grid">
+              <dt>Source</dt>
+              <dd>{maskCandidate.source} / {maskCandidate.algorithm_version}</dd>
+              <dt>Auto</dt>
+              <dd>{maskCandidate.quality_auto_score.toFixed(1)} / 5</dd>
+              <dt>Area</dt>
+              <dd>{maskCandidate.area_px}px</dd>
+              <dt>Anchor</dt>
+              <dd>{maskCandidate.anchor_px.map((v) => v.toFixed(1)).join(", ")}</dd>
+              <dt>Status</dt>
+              <dd>{maskCandidate.stale ? "stale after annotation edit" : "current"}</dd>
+            </dl>
+          ) : (
+            <p className="mask-empty">No SAM mask candidate yet. Press G after selecting this object.</p>
+          )}
+          <div className="score-grid" aria-label="Mask score">
+            {[0, 1, 2, 3].map((score) => (
+              <button
+                key={score}
+                disabled={maskBusy}
+                className={maskReview?.score === score ? "active" : ""}
+                onClick={() => onMaskScore(score)}
+                title={`Manual mask score ${score}`}
+              >
+                {score}
+              </button>
+            ))}
+          </div>
+          {maskReview && (
+            <div className="mask-review-summary">
+              <strong>{maskReview.score}/3 · {maskReview.review_status}</strong>
+              <span>{maskReview.reviewer} · {maskReview.reviewed_at}</span>
+            </div>
+          )}
+          <label>Failure Tags</label>
+          <div className="tag-grid">
+            {maskFailureTags.map((tag) => {
+              const active = Boolean(maskReview?.failure_tags.includes(tag));
+              return (
+                <button
+                  key={tag}
+                  type="button"
+                  disabled={maskBusy}
+                  className={active ? "tag active" : "tag"}
+                  onClick={() => {
+                    const current = new Set(maskReview?.failure_tags || []);
+                    if (current.has(tag)) current.delete(tag);
+                    else current.add(tag);
+                    onMaskFailureTagsChange(selectedObject.instance_id, Array.from(current));
+                  }}
+                >
+                  {tag}
+                </button>
+              );
+            })}
+          </div>
+          <label>Mask Notes</label>
+          <textarea
+            key={`mask-notes-${selectedObject.instance_id}-${maskReview?.reviewed_at || "empty"}`}
+            disabled={maskBusy}
+            defaultValue={maskReview?.notes || ""}
+            rows={2}
+            onBlur={(event) => onMaskNotesChange(selectedObject.instance_id, event.target.value)}
+            placeholder="boundary issue, anchor bias, occlusion..."
           />
         </section>
       )}

@@ -16,6 +16,9 @@ import type {
   DatasetStats,
   ImageItem,
   LockInfo,
+  MaskCandidate,
+  MaskReview,
+  MaskReviewPayload,
   Mode,
   ValidationMessage,
   YawLabelStatus
@@ -24,6 +27,19 @@ import type {
 const DEFAULT_CLASSES: ClassInfo[] = [{ id: 0, name: "phial", graspable: true }];
 const UPLOAD_CHUNK_SIZE = 960 * 1024;
 const DEFAULT_UPLOAD_CONCURRENCY = 18;
+const IMAGE_PAGE_SIZE = 320;
+
+const MASK_FAILURE_TAGS = [
+  "edge_miss",
+  "background_merge",
+  "occlusion",
+  "reflection",
+  "jagged_edge",
+  "anchor_shift",
+  "instance_mix",
+  "bbox_error",
+  "class_error"
+];
 
 function clampUploadConcurrency(value: number): number {
   if (!Number.isFinite(value)) return DEFAULT_UPLOAD_CONCURRENCY;
@@ -116,6 +132,7 @@ export function App() {
   const [dataset, setDataset] = useState<DatasetMeta | null>(null);
   const [images, setImages] = useState<ImageItem[]>([]);
   const [totalImages, setTotalImages] = useState(0);
+  const [imageOffset, setImageOffset] = useState(0);
   const [imageStatus, setImageStatus] = useState("all");
   const [selectedImage, setSelectedImage] = useState<ImageItem | null>(null);
   const [annotationState, dispatchAnnotationState] = useReducer(annotationStateReducer, { payload: null });
@@ -136,6 +153,9 @@ export function App() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadMessage, setUploadMessage] = useState("");
   const [uploadConcurrency, setUploadConcurrency] = useState(initialUploadConcurrency);
+  const [maskReview, setMaskReview] = useState<MaskReviewPayload | null>(null);
+  const [maskOverlayVisible, setMaskOverlayVisible] = useState(true);
+  const [maskBusy, setMaskBusy] = useState(false);
   const uploadingRef = useRef(false);
 
   const payload = annotationState.payload;
@@ -143,6 +163,13 @@ export function App() {
   const editable = Boolean(lock?.lock_token && annotation);
   const imageUrl = dataset && selectedImage ? `/api/datasets/${dataset.dataset_id}/images/${selectedImage.image_id}/file` : "";
   const lockedBy = payload?.lock?.user || null;
+  const selectedMaskObject = maskReview?.objects.find((item) => item.instance_id === selection.objectId) || null;
+  const selectedMaskCandidate = selectedMaskObject?.candidate || null;
+  const selectedMaskReview = selectedMaskObject?.review || null;
+  const selectedMaskPreviewUrl =
+    dataset && selectedImage && selection.objectId && selectedMaskCandidate
+      ? `${api.maskPreviewUrl(dataset.dataset_id, selectedImage.image_id, selection.objectId)}?v=${selectedMaskCandidate.candidate_id}`
+      : "";
 
   useEffect(() => {
     if (!loggedIn) return;
@@ -166,6 +193,14 @@ export function App() {
   deleteSelectionRef.current = deleteSelection;
   const selectAdjacentImageRef = useRef(selectAdjacentImage);
   selectAdjacentImageRef.current = selectAdjacentImage;
+  const selectAdjacentObjectRef = useRef(selectAdjacentObject);
+  selectAdjacentObjectRef.current = selectAdjacentObject;
+  const generateMaskCandidateRef = useRef(generateMaskCandidateForSelection);
+  generateMaskCandidateRef.current = generateMaskCandidateForSelection;
+  const scoreMaskCandidateRef = useRef(scoreMaskCandidate);
+  scoreMaskCandidateRef.current = scoreMaskCandidate;
+  const clearMaskReviewRef = useRef(clearMaskReviewForSelection);
+  clearMaskReviewRef.current = clearMaskReviewForSelection;
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -178,6 +213,30 @@ export function App() {
       if (event.key === "Delete" || event.key === "Backspace") {
         event.preventDefault();
         deleteSelectionRef.current();
+      }
+      if (event.key.toLowerCase() === "m") {
+        event.preventDefault();
+        setMode("mask");
+      }
+      if (event.key.toLowerCase() === "g") {
+        event.preventDefault();
+        void generateMaskCandidateRef.current();
+      }
+      if (event.key.toLowerCase() === "o") {
+        event.preventDefault();
+        setMaskOverlayVisible((current) => !current);
+      }
+      if (event.key === "[" || event.key === "]") {
+        event.preventDefault();
+        selectAdjacentObjectRef.current(event.key === "]" ? 1 : -1);
+      }
+      if (!event.ctrlKey && !event.metaKey && /^[0-5]$/.test(event.key)) {
+        event.preventDefault();
+        void scoreMaskCandidateRef.current(Number(event.key));
+      }
+      if (event.key.toLowerCase() === "r") {
+        event.preventDefault();
+        void clearMaskReviewRef.current();
       }
       if (event.key.toLowerCase() === "n" || event.key === "ArrowRight" || event.key.toLowerCase() === "d") {
         event.preventDefault();
@@ -256,7 +315,7 @@ export function App() {
       setValidationWarnings(saved.validation?.warnings || []);
       setStats(null);
       setStatusLine("Saved");
-      await loadImages();
+      updateImageRowFromAnnotation(saved);
       return true;
     } catch (exc) {
       const validation = extractValidationResult(exc);
@@ -284,6 +343,28 @@ export function App() {
       errors: Array.isArray(errors) ? (errors as ValidationMessage[]) : [],
       warnings: Array.isArray(warnings) ? (warnings as ValidationMessage[]) : []
     };
+  }
+
+  function updateImageRowFromAnnotation(saved: AnnotationPayload) {
+    const objectCount = saved.annotation.objects.length;
+    const axisCount = saved.annotation.objects.filter((obj) => obj.main_axis_points && obj.main_axis_points.length === 2).length;
+    const status: ImageItem["status"] = objectCount > 0 ? "annotated" : "empty";
+    setImages((current) =>
+      current.map((item) =>
+        item.image_id === saved.image_id
+          ? { ...item, status, object_count: objectCount, axis_count: axisCount, lock: null }
+          : item
+      )
+    );
+    setSelectedImage((current) =>
+      current && current.image_id === saved.image_id
+        ? { ...current, status, object_count: objectCount, axis_count: axisCount, lock: null }
+        : current
+    );
+    setDataset((current) => {
+      if (!current) return current;
+      return { ...current };
+    });
   }
 
   async function refreshStats(meta = dataset) {
@@ -325,11 +406,18 @@ export function App() {
     return saveCurrent();
   }
 
-  async function loadImages(meta = dataset, status = imageStatus) {
-    if (!meta) return;
-    const data = await api.images(meta.dataset_id, status);
-    setImages(data.items);
+  async function loadImages(meta = dataset, status = imageStatus, offset = 0, append = false): Promise<ImageItem[]> {
+    if (!meta) return [];
+    const data = await api.images(meta.dataset_id, status, offset, IMAGE_PAGE_SIZE);
+    setImages((current) => (append ? [...current, ...data.items] : data.items));
     setTotalImages(data.total);
+    setImageOffset(data.offset + data.items.length);
+    return data.items;
+  }
+
+  async function loadMoreImages() {
+    if (!dataset || imageOffset >= totalImages) return;
+    await loadImages(dataset, imageStatus, imageOffset, true);
   }
 
   async function selectDataset(datasetId: string) {
@@ -578,8 +666,10 @@ export function App() {
         setPayload(null);
         setSelection({ objectId: null, handle: null });
       }
-      const data = await api.images(dataset.dataset_id, imageStatus);
+      const data = await api.images(dataset.dataset_id, imageStatus, 0, IMAGE_PAGE_SIZE);
       setImages(data.items);
+      setTotalImages(data.total);
+      setImageOffset(data.offset + data.items.length);
       setStatusLine(`Deleted ${item.image_key}`);
     } catch (exc) {
       setError(String((exc as Error).message || exc));
@@ -619,8 +709,10 @@ export function App() {
       setPayload(null);
       setSelection({ objectId: null, handle: null });
     }
-    const data = await api.images(dataset.dataset_id, imageStatus);
+    const data = await api.images(dataset.dataset_id, imageStatus, 0, IMAGE_PAGE_SIZE);
     setImages(data.items);
+    setTotalImages(data.total);
+    setImageOffset(data.offset + data.items.length);
     setStatusLine(`Deleted ${deletedCount} image(s)`);
     if (failures.length) {
       setError(`Some images were not deleted: ${failures.slice(0, 3).join("; ")}`);
@@ -632,13 +724,18 @@ export function App() {
     await releaseCurrentLock();
     setSelectedImage(item);
     setPayload(null);
+    setMaskReview(null);
     setSelection({ objectId: null, handle: null });
     setValidationErrors([]);
     setValidationWarnings([]);
     setStatusLine("");
     if (!dataset) return;
-    const next = await api.annotation(dataset.dataset_id, item.image_id);
+    const [next, review] = await Promise.all([
+      api.annotation(dataset.dataset_id, item.image_id),
+      api.maskReview(dataset.dataset_id, item.image_id).catch(() => null)
+    ]);
     setPayload(next);
+    setMaskReview(review);
     setDirty(false);
     setMode("bbox");
     try {
@@ -654,8 +751,132 @@ export function App() {
     if (!images.length) return;
     const currentIndex = selectedImage ? images.findIndex((item) => item.image_id === selectedImage.image_id) : -1;
     const fallback = delta > 0 ? 0 : images.length - 1;
-    const nextIndex = currentIndex >= 0 ? (currentIndex + delta + images.length) % images.length : fallback;
+    let nextIndex = currentIndex >= 0 ? currentIndex + delta : fallback;
+    if (nextIndex >= images.length && totalImages > images.length) {
+      const more = await loadImages(dataset, imageStatus, imageOffset, true);
+      if (more.length > 0) {
+        await selectImage(more[0]);
+        return;
+      }
+    }
+    nextIndex = (nextIndex + images.length) % images.length;
     await selectImage(images[nextIndex]);
+  }
+
+  function selectAdjacentObject(delta: number) {
+    if (!annotation?.objects.length) return;
+    const currentIndex = selection.objectId
+      ? annotation.objects.findIndex((obj) => obj.instance_id === selection.objectId)
+      : -1;
+    const fallback = delta > 0 ? 0 : annotation.objects.length - 1;
+    const nextIndex = currentIndex >= 0 ? (currentIndex + delta + annotation.objects.length) % annotation.objects.length : fallback;
+    const next = annotation.objects[nextIndex];
+    setSelection({ objectId: next.instance_id, handle: null });
+  }
+
+  function mergeMaskObject(instanceId: number, patch: Partial<NonNullable<MaskReviewPayload["objects"][number]>>) {
+    setMaskReview((current) => {
+      if (!current) {
+        return {
+          image_id: selectedImage?.image_id || "",
+          image_key: selectedImage?.image_key || "",
+          objects: [{ instance_id: instanceId, candidate: null, review: null, ...patch }]
+        };
+      }
+      const found = current.objects.some((item) => item.instance_id === instanceId);
+      return {
+        ...current,
+        objects: found
+          ? current.objects.map((item) => (item.instance_id === instanceId ? { ...item, ...patch } : item))
+          : [...current.objects, { instance_id: instanceId, candidate: null, review: null, ...patch }]
+      };
+    });
+  }
+
+  async function generateMaskCandidateForSelection(): Promise<MaskCandidate | null> {
+    if (!dataset || !selectedImage || !selection.objectId || maskBusy) {
+      if (!selection.objectId) setStatusLine("Select an object before generating a mask candidate");
+      return null;
+    }
+    setMaskBusy(true);
+    setMode("mask");
+    setError("");
+    try {
+      setStatusLine("Generating mask candidate...");
+      const candidate = await api.generateMaskCandidate(dataset.dataset_id, selectedImage.image_id, selection.objectId);
+      mergeMaskObject(selection.objectId, { candidate });
+      setStatusLine(`Mask candidate generated: auto score ${candidate.quality_auto_score.toFixed(1)}`);
+      return candidate;
+    } catch (exc) {
+      setError(String((exc as Error).message || exc));
+      return null;
+    } finally {
+      setMaskBusy(false);
+    }
+  }
+
+  async function scoreMaskCandidate(score: number): Promise<MaskReview | null> {
+    if (!dataset || !selectedImage || !selection.objectId || maskBusy) return null;
+    let candidate = selectedMaskCandidate;
+    if (!candidate) {
+      candidate = await generateMaskCandidateForSelection();
+      if (!candidate) return null;
+    }
+    setMaskBusy(true);
+    setError("");
+    try {
+      const review = await api.saveMaskReview(dataset.dataset_id, selectedImage.image_id, selection.objectId, {
+        candidate_id: candidate.candidate_id,
+        score,
+        failure_tags: selectedMaskReview?.failure_tags || [],
+        notes: selectedMaskReview?.notes || ""
+      });
+      mergeMaskObject(selection.objectId, { review });
+      setStatusLine(`Mask score saved: ${score}/3`);
+      return review;
+    } catch (exc) {
+      setError(String((exc as Error).message || exc));
+      return null;
+    } finally {
+      setMaskBusy(false);
+    }
+  }
+
+  async function saveMaskReviewPatch(instanceId: number, patch: Partial<Pick<MaskReview, "failure_tags" | "notes">>) {
+    if (!dataset || !selectedImage || maskBusy) return;
+    const current = maskReview?.objects.find((item) => item.instance_id === instanceId);
+    const candidate = current?.candidate;
+    const currentReview = current?.review;
+    const score = currentReview?.score ?? 2;
+    setMaskBusy(true);
+    try {
+      const review = await api.saveMaskReview(dataset.dataset_id, selectedImage.image_id, instanceId, {
+        candidate_id: candidate?.candidate_id || currentReview?.candidate_id || null,
+        score,
+        failure_tags: patch.failure_tags ?? currentReview?.failure_tags ?? [],
+        notes: patch.notes ?? currentReview?.notes ?? ""
+      });
+      mergeMaskObject(instanceId, { review });
+      setStatusLine("Mask review updated");
+    } catch (exc) {
+      setError(String((exc as Error).message || exc));
+    } finally {
+      setMaskBusy(false);
+    }
+  }
+
+  async function clearMaskReviewForSelection() {
+    if (!dataset || !selectedImage || !selection.objectId || maskBusy) return;
+    setMaskBusy(true);
+    try {
+      await api.clearMaskReview(dataset.dataset_id, selectedImage.image_id, selection.objectId);
+      mergeMaskObject(selection.objectId, { review: null });
+      setStatusLine("Mask review cleared");
+    } catch (exc) {
+      setError(String((exc as Error).message || exc));
+    } finally {
+      setMaskBusy(false);
+    }
   }
 
   async function startEditing() {
@@ -755,9 +976,10 @@ export function App() {
         onDatasetClassesChange={(classes) => setDataset((current) => (current ? { ...current, classes } : current))}
         onSaveDatasetClasses={() => void saveDatasetClasses()}
         onRefreshImages={() => void loadImages()}
+        onLoadMoreImages={() => void loadMoreImages()}
         onStatusChange={(status) => {
           setImageStatus(status);
-          void loadImages(dataset, status);
+          void loadImages(dataset, status, 0, false);
         }}
         onImageSelect={(image) => void selectImage(image)}
         onUploadFilesChange={handleUploadFilesChange}
@@ -796,6 +1018,9 @@ export function App() {
           onAction={dispatchAnnotation}
           onNoObjectForAxis={() => setStatusLine("Draw a bbox first, then select it before drawing the axis")}
           defaultClassAction={defaultClassAction}
+          maskCandidate={selectedMaskCandidate}
+          maskPreviewUrl={selectedMaskPreviewUrl}
+          maskOverlayVisible={maskOverlayVisible}
         />
       </section>
 
@@ -808,6 +1033,11 @@ export function App() {
         validationErrors={validationErrors}
         validationWarnings={validationWarnings}
         jobMessage={jobMessage}
+        maskCandidate={selectedMaskCandidate}
+        maskReview={selectedMaskReview}
+        maskBusy={maskBusy}
+        maskOverlayVisible={maskOverlayVisible}
+        maskFailureTags={MASK_FAILURE_TAGS}
         onSelectionChange={setSelection}
         onClassChange={(instanceId: number, classInfo: ClassInfo) =>
           dispatchAnnotation({ type: "updateObjectClass", instanceId, classInfo })
@@ -829,6 +1059,12 @@ export function App() {
         }
         onExport={(exportType) => void exportDataset(exportType)}
         onDeleteImage={() => { if (selectedImage) void deleteImage(selectedImage); }}
+        onGenerateMaskCandidate={() => void generateMaskCandidateForSelection()}
+        onMaskScore={(score) => void scoreMaskCandidate(score)}
+        onMaskOverlayToggle={() => setMaskOverlayVisible((current) => !current)}
+        onMaskFailureTagsChange={(instanceId, tags) => void saveMaskReviewPatch(instanceId, { failure_tags: tags })}
+        onMaskNotesChange={(instanceId, notes) => void saveMaskReviewPatch(instanceId, { notes })}
+        onClearMaskReview={() => void clearMaskReviewForSelection()}
       />
     </main>
   );
