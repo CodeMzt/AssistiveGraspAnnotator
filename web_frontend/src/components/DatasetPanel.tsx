@@ -1,8 +1,9 @@
 import { Database, Images, Pencil, Plus, RefreshCw, Settings2, Trash2, Upload } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { ClassInfo, DatasetMeta, ImageItem } from "../types";
+import type { ClassInfo, DatasetMeta, DatasetStats, ImageItem } from "../types";
 import { ClassEditorDialog } from "./ClassEditorDialog";
 import { DatasetManagerDialog } from "./DatasetManagerDialog";
+import { StatsPanel } from "./StatsPanel";
 
 type Props = {
   username: string;
@@ -10,6 +11,7 @@ type Props = {
   newDatasetName: string;
   dataset: DatasetMeta | null;
   images: ImageItem[];
+  totalImages: number;
   imageStatus: string;
   selectedImageId: string | null;
   uploadFiles: File[];
@@ -17,6 +19,8 @@ type Props = {
   uploadProgress: number;
   uploadMessage: string;
   uploadConcurrency: number;
+  stats: DatasetStats | null;
+  statsLoading: boolean;
   onNewDatasetNameChange: (value: string) => void;
   onCreateDataset: () => void;
   onSelectDataset: (datasetId: string) => void;
@@ -26,11 +30,13 @@ type Props = {
   onDatasetClassesChange: (classes: ClassInfo[]) => void;
   onSaveDatasetClasses: () => void;
   onRefreshImages: () => void;
+  onLoadMoreImages: () => void;
   onStatusChange: (status: string) => void;
   onImageSelect: (image: ImageItem) => void;
   onUploadFilesChange: (files: File[]) => void;
   onUploadConcurrencyChange: (value: number) => void;
   onUploadDataset: () => void;
+  onRefreshStats: () => void;
   onDeleteImage: (image: ImageItem) => void;
   onDeleteImages: (images: ImageItem[]) => void;
 };
@@ -41,6 +47,7 @@ export function DatasetPanel({
   newDatasetName,
   dataset,
   images,
+  totalImages,
   imageStatus,
   selectedImageId,
   uploadFiles,
@@ -48,6 +55,8 @@ export function DatasetPanel({
   uploadProgress,
   uploadMessage,
   uploadConcurrency,
+  stats,
+  statsLoading,
   onNewDatasetNameChange,
   onCreateDataset,
   onSelectDataset,
@@ -57,11 +66,13 @@ export function DatasetPanel({
   onDatasetClassesChange,
   onSaveDatasetClasses,
   onRefreshImages,
+  onLoadMoreImages,
   onStatusChange,
   onImageSelect,
   onUploadFilesChange,
   onUploadConcurrencyChange,
   onUploadDataset,
+  onRefreshStats,
   onDeleteImage,
   onDeleteImages
 }: Props) {
@@ -138,6 +149,15 @@ export function DatasetPanel({
           </div>
         )}
       </section>
+
+      {dataset && (
+        <StatsPanel
+          stats={stats}
+          loading={statsLoading}
+          onRefresh={onRefreshStats}
+          onImageSelect={onImageSelect}
+        />
+      )}
 
       {dataset && (
         <section className="source-block">
@@ -272,13 +292,17 @@ export function DatasetPanel({
             <span>{dataset.annotated} annotated / {dataset.unannotated} unannotated</span>
           </div>
           <button type="button" className="wide-button" onClick={() => setManagerOpen(true)}>
-            <Settings2 size={16} /> Manage Images
+            <Settings2 size={16} /> Manage Images ({images.length}{totalImages > 0 ? ` / ${totalImages}` : ""})
           </button>
           <select value={imageStatus} onChange={(event) => onStatusChange(event.target.value)}>
             <option value="all">All</option>
             <option value="unannotated">Unannotated</option>
             <option value="empty">Empty</option>
             <option value="annotated">Annotated</option>
+            <option value="legacy">Legacy class names</option>
+            <option value="yaw_review">Yaw review</option>
+            <option value="mask_unreviewed">Mask unreviewed</option>
+            <option value="mask_low_score">Mask low score</option>
           </select>
           <div className="image-list">
             {images.map((item) => (
@@ -293,6 +317,11 @@ export function DatasetPanel({
               </button>
             ))}
           </div>
+          {images.length < totalImages && (
+            <button type="button" className="wide-button" onClick={onLoadMoreImages}>
+              Load more ({images.length} / {totalImages})
+            </button>
+          )}
         </section>
       )}
     </aside>

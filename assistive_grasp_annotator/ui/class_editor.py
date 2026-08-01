@@ -23,11 +23,11 @@ from PySide6.QtWidgets import (
 )
 import yaml
 
-DEFAULT_POLICIES = ["grasp_rect", "center_or_grasp_rect", "report_only"]
+DEFAULT_POLICIES: list[str] = []
 
 
 class ClassEditorWidget(QWidget):
-    """Editable table of classes. Columns: id, name, graspable, policy."""
+    """Editable table of classes. Columns: id, name, graspable."""
 
     dirty_changed = Signal(bool)
 
@@ -57,15 +57,13 @@ class ClassEditorWidget(QWidget):
 
         # Table
         self._table = QTableWidget()
-        self._table.setColumnCount(4)
-        self._table.setHorizontalHeaderLabels(["ID", "Name", "Graspable", "Policy"])
+        self._table.setColumnCount(3)
+        self._table.setHorizontalHeaderLabels(["ID", "Name", "Graspable"])
         self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self._table.setColumnWidth(0, 50)
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self._table.setColumnWidth(2, 80)
-        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self._table.setColumnWidth(3, 160)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.verticalHeader().setVisible(False)
 
@@ -88,13 +86,10 @@ class ClassEditorWidget(QWidget):
                 continue
             cb = self._table.cellWidget(row, 2)
             graspable = cb.isChecked() if isinstance(cb, QCheckBox) else True
-            combo = self._table.cellWidget(row, 3)
-            policy = combo.currentText() if isinstance(combo, QComboBox) else "grasp_rect"
             result.append({
                 "id": int(id_item.text()),
                 "name": name,
                 "graspable": graspable,
-                "policy": policy,
             })
         return result
 
@@ -106,7 +101,6 @@ class ClassEditorWidget(QWidget):
                 cls.get("id", 0),
                 cls.get("name", ""),
                 cls.get("graspable", True),
-                cls.get("policy", "grasp_rect"),
             )
         self._table.blockSignals(False)
         self._set_dirty(False)
@@ -136,7 +130,7 @@ class ClassEditorWidget(QWidget):
     # Internal
     # ------------------------------------------------------------------
 
-    def _insert_row_internal(self, class_id: int, name: str, graspable: bool, policy: str):
+    def _insert_row_internal(self, class_id: int, name: str, graspable: bool):
         row = self._table.rowCount()
         self._table.insertRow(row)
 
@@ -154,13 +148,6 @@ class ClassEditorWidget(QWidget):
         cb.toggled.connect(lambda: self._set_dirty(True))
         self._table.setCellWidget(row, 2, cb)
 
-        # Policy combo
-        combo = QComboBox()
-        combo.addItems(DEFAULT_POLICIES)
-        if policy in DEFAULT_POLICIES:
-            combo.setCurrentText(policy)
-        combo.currentTextChanged.connect(lambda: self._set_dirty(True))
-        self._table.setCellWidget(row, 3, combo)
 
     def _add_row(self):
         next_id = 0
@@ -168,7 +155,7 @@ class ClassEditorWidget(QWidget):
             item = self._table.item(row, 0)
             if item is not None:
                 next_id = max(next_id, int(item.text()) + 1)
-        self._insert_row_internal(next_id, "", True, "grasp_rect")
+        self._insert_row_internal(next_id, "", True)
         self._table.selectRow(self._table.rowCount() - 1)
         self._table.editItem(self._table.item(self._table.rowCount() - 1, 1))
         self._set_dirty(True)

@@ -70,6 +70,12 @@ class ClassesRequest(BaseModel):
 
 
 class ExportRequest(BaseModel):
-    export_type: Literal["yolo", "grasp_roi", "target_maps"]
-    output_dir: str | None = None
-    map_size: int = 300
+    export_type: Literal["yolo", "yolo_angle", "obb_teacher"]
+
+
+class MaskReviewRequest(BaseModel):
+    candidate_id: str | None = None
+    score: int = Field(ge=0, le=3)
+    review_status: Literal["accepted", "usable", "uncertain", "rejected"] | None = None
+    failure_tags: list[str] = Field(default_factory=list)
+    notes: str = ""

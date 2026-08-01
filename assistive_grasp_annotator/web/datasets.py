@@ -7,8 +7,9 @@ import json
 import re
 import shutil
 import tempfile
+from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,9 @@ from PIL import Image
 
 from assistive_grasp_annotator.models.annotation import AnnotationModel
 from assistive_grasp_annotator.models.classes import ClassRegistry
+from assistive_grasp_annotator.tools.annotation_quality import ValidationIssue
+from assistive_grasp_annotator.tools.mask_common import is_supported_mask_candidate, object_signature
+from assistive_grasp_annotator.tools.sam_teacher_client import SamTeacherError, generate_sam_mask_candidate
 from assistive_grasp_annotator.tools.validators import validate_annotation
 from assistive_grasp_annotator.web.config import WebConfig, resolve_allowed_path
 from assistive_grasp_annotator.web.ids import decode_image_id, encode_image_id
@@ -25,22 +29,48 @@ from assistive_grasp_annotator.web.uploads import AssembledUpload
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
-CLASS_POLICIES = {"grasp_rect", "center_or_grasp_rect", "report_only"}
 IGNORED_SCAN_DIRS = {"annotations", "generated", "splits", ".aga_trash"}
+YAW_SENSITIVE_CLASSES = {"earbud", "phone", "remote", "tissue"}
+CANONICAL_CLASS_NAMES = {"earbud", "phial", "bottle", "phone", "remote", "tissue", "apple"}
+LEGACY_CLASS_SUFFIX = "_" + "A"
 
 
 class DatasetError(ValueError):
     pass
 
 
-def split_validation_messages(messages: list[str]) -> dict[str, list[str]]:
-    errors: list[str] = []
-    warnings: list[str] = []
+class MaskGenerationError(DatasetError):
+    pass
+
+
+class DatasetValidationError(DatasetError):
+    def __init__(self, validation: dict[str, list[dict[str, Any]]]):
+        super().__init__("Annotation validation failed")
+        self.validation = validation
+
+
+def split_validation_messages(
+    messages: list[ValidationIssue | str],
+    image_key: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
     for message in messages:
-        if "WARNING" in message:
-            warnings.append(message.replace(" (WARNING)", "").replace("WARNING: ", ""))
+        if isinstance(message, ValidationIssue):
+            payload = message.to_dict(image_key=image_key)
+            if message.severity == "warning":
+                warnings.append(payload)
+            else:
+                errors.append(payload)
+            continue
+        payload = {"severity": "warning" if "WARNING" in message else "error", "message": message}
+        if image_key is not None:
+            payload["image_key"] = image_key
+        if payload["severity"] == "warning":
+            payload["message"] = message.replace(" (WARNING)", "").replace("WARNING: ", "")
+            warnings.append(payload)
         else:
-            errors.append(message)
+            errors.append(payload)
     return {"errors": errors, "warnings": warnings}
 
 
@@ -59,6 +89,57 @@ def _annotation_etag(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _describe_numbers(values: list[float]) -> dict[str, float | int | None]:
+    clean = sorted(float(v) for v in values if v == v)
+    if not clean:
+        return {"count": 0, "mean": None, "p10": None, "p50": None, "p90": None}
+    return {
+        "count": len(clean),
+        "mean": sum(clean) / len(clean),
+        "p10": _percentile(clean, 0.10),
+        "p50": _percentile(clean, 0.50),
+        "p90": _percentile(clean, 0.90),
+    }
+
+
+def _percentile(sorted_values: list[float], q: float) -> float:
+    if not sorted_values:
+        return 0.0
+    index = int(round((len(sorted_values) - 1) * q))
+    index = max(0, min(len(sorted_values) - 1, index))
+    return sorted_values[index]
+
+
+def _class_suggestions(row: dict[str, Any]) -> list[str]:
+    suggestions: list[str] = []
+    object_count = int(row["object_count"])
+    axis_count = int(row.get("axis_count", 0))
+    yaw_valid_count = int(row.get("yaw_valid_count", 0))
+    if object_count < 50:
+        suggestions.append("类别样本偏少，建议优先追加采集。")
+    if object_count > 0 and yaw_valid_count == 0 and row.get("graspable"):
+        suggestions.append("可抓取类别缺少有效主轴标注 (yaw_label_status=valid)，请切换到 Axis 模式补标。")
+    if object_count > 0 and axis_count < object_count * 0.5 and row.get("graspable"):
+        suggestions.append("主轴标注覆盖率不足 50%，建议补标主要姿态方向。")
+    return suggestions
+
+
+def _class_suggestions_v2(row: dict[str, Any]) -> list[str]:
+    suggestions: list[str] = []
+    object_count = int(row["object_count"])
+    axis_count = int(row.get("axis_count", 0))
+    yaw_valid_count = int(row.get("yaw_valid_count", 0))
+    if object_count == 0:
+        suggestions.append("该类别尚无标注，如果是训练类别需要优先采集。")
+    elif object_count < 50:
+        suggestions.append("类别样本偏少，建议优先追加采集。")
+    if object_count > 0 and yaw_valid_count == 0 and row.get("graspable"):
+        suggestions.append("可抓取类别缺少有效主轴标注 (yaw_label_status=valid)，请切换到 Axis 模式补标。")
+    if object_count > 0 and axis_count < object_count * 0.5 and row.get("graspable"):
+        suggestions.append("主轴标注覆盖率不足 50%，建议补标主要姿态方向。")
+    return suggestions
+
+
 def _normalize_classes(classes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     seen_ids: set[int] = set()
@@ -75,17 +156,15 @@ def _normalize_classes(classes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         name = str(raw.get("name", "")).strip()
         if not name:
             raise DatasetError("Class name is required.")
+        if name.endswith(LEGACY_CLASS_SUFFIX) or name not in CANONICAL_CLASS_NAMES:
+            raise DatasetError("Class name must be one of canonical object_vocab_v1 names: earbud, phial, bottle, phone, remote, tissue, apple.")
         if name in seen_names:
             raise DatasetError(f"Duplicate class name: {name}")
-        policy = str(raw.get("policy") or "grasp_rect").strip()
-        if policy not in CLASS_POLICIES:
-            raise DatasetError(f"Unsupported class policy: {policy}")
         normalized.append(
             {
                 "id": class_id,
                 "name": name,
                 "graspable": bool(raw.get("graspable", True)),
-                "policy": policy,
             }
         )
         seen_ids.add(class_id)
@@ -120,6 +199,44 @@ def _looks_like_dataset_root(path: Path) -> bool:
     )
 
 
+def _count_annotation(ann_path: Path) -> tuple[int, int]:
+    """Fast count of objects and axis-annotated objects from annotation JSON."""
+    try:
+        data = json.loads(ann_path.read_text(encoding="utf-8"))
+        objects = data.get("objects", [])
+        object_count = len(objects)
+        axis_count = sum(1 for obj in objects if obj.get("main_axis_points"))
+        return object_count, axis_count
+    except Exception:
+        return 0, 0
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=str(path.parent)) as tmp:
+        json.dump(payload, tmp, indent=2, ensure_ascii=False)
+        tmp.write("\n")
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(path)
+
+
+def _review_status_from_score(score: int) -> str:
+    if score >= 3:
+        return "accepted"
+    if score == 2:
+        return "usable"
+    if score == 1:
+        return "uncertain"
+    return "rejected"
+
+
 @dataclass(frozen=True)
 class ImageEntry:
     image_id: str
@@ -128,7 +245,7 @@ class ImageEntry:
     annotation_path: Path
     status: str
     object_count: int
-    grasp_count: int
+    axis_count: int
 
     def to_dict(self, lock: dict[str, Any] | None = None) -> dict[str, Any]:
         return {
@@ -136,7 +253,7 @@ class ImageEntry:
             "image_key": self.image_key,
             "status": self.status,
             "object_count": self.object_count,
-            "grasp_count": self.grasp_count,
+            "axis_count": self.axis_count,
             "lock": lock,
         }
 
@@ -151,6 +268,8 @@ class WebDataset:
         self._image_paths = self._scan_images()
         self._image_by_key = {self._make_image_key(path): path for path in self._image_paths}
         self._classes = self._load_classes()
+        self._annotation_meta: dict[str, tuple[int, int]] = {}
+        self._build_annotation_index()
 
     @property
     def image_paths(self) -> list[Path]:
@@ -185,6 +304,26 @@ class WebDataset:
     def _refresh_images(self) -> None:
         self._image_paths = self._scan_images()
         self._image_by_key = {self._make_image_key(path): path for path in self._image_paths}
+        self._build_annotation_index()
+
+    def _build_annotation_index(self) -> None:
+        self._annotation_meta = {}
+        for path in self._image_paths:
+            ann_path = self._get_annotation_path(path)
+            if ann_path.exists():
+                key = self._make_image_key(path)
+                obj_count, axis_count = _count_annotation(ann_path)
+                self._annotation_meta[key] = (obj_count, axis_count)
+
+    def _update_annotation_meta(self, image_key: str) -> None:
+        img_path = self._image_by_key.get(image_key)
+        if img_path is None:
+            return
+        ann_path = self._get_annotation_path(img_path)
+        if ann_path.exists():
+            self._annotation_meta[image_key] = _count_annotation(ann_path)
+        else:
+            self._annotation_meta.pop(image_key, None)
 
     def _make_image_key(self, img_path: Path) -> str:
         images_dir = self.root / "images"
@@ -242,6 +381,112 @@ class WebDataset:
             "image_key": self._make_image_key(img_path),
         }
 
+    def _mask_artifact_root(self, image_id: str, instance_id: int, kind: str) -> Path:
+        img_path = self.image_path_for_id(image_id)
+        image_key = self._make_image_key(img_path)
+        rel = Path(image_key).with_suffix("")
+        return self.root / "generated" / kind / rel / f"obj_{int(instance_id):03d}"
+
+    def _latest_candidate_path(self, image_id: str, instance_id: int) -> Path | None:
+        root = self._mask_artifact_root(image_id, instance_id, "mask_candidates")
+        candidates = sorted(root.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in candidates:
+            candidate = _read_json(path)
+            if is_supported_mask_candidate(candidate):
+                return path
+        return None
+
+    def _review_path(self, image_id: str, instance_id: int) -> Path:
+        root = self._mask_artifact_root(image_id, instance_id, "mask_reviews")
+        return root / "review.json"
+
+    def _candidate_payload(self, image_id: str, candidate_path: Path | None) -> dict[str, Any] | None:
+        if candidate_path is None:
+            return None
+        candidate = _read_json(candidate_path)
+        if not candidate:
+            return None
+        return candidate
+
+    def mask_review_payload(self, image_id: str) -> dict[str, Any]:
+        img_path = self.image_path_for_id(image_id)
+        ann = self.load_annotation(img_path).to_dict()
+        objects = []
+        for obj in ann.get("objects", []):
+            instance_id = int(obj.get("instance_id") or 0)
+            candidate_path = self._latest_candidate_path(image_id, instance_id)
+            candidate = self._candidate_payload(image_id, candidate_path)
+            current_signature = object_signature(ann, obj)
+            if candidate is not None:
+                candidate["stale"] = candidate.get("annotation_signature") != current_signature
+            review = _read_json(self._review_path(image_id, instance_id))
+            objects.append({
+                "instance_id": instance_id,
+                "candidate": candidate,
+                "review": review,
+            })
+        return {"image_id": image_id, "image_key": self._make_image_key(img_path), "objects": objects}
+
+    def generate_mask_candidate(self, image_id: str, instance_id: int) -> dict[str, Any]:
+        img_path = self.image_path_for_id(image_id)
+        ann = self.load_annotation(img_path).to_dict()
+        obj = next((item for item in ann.get("objects", []) if int(item.get("instance_id") or 0) == int(instance_id)), None)
+        if obj is None:
+            raise DatasetError(f"Unknown object instance: {instance_id}")
+        artifact_dir = self._mask_artifact_root(image_id, instance_id, "mask_candidates")
+        try:
+            candidate = generate_sam_mask_candidate(img_path, ann, obj, artifact_dir)
+        except SamTeacherError as exc:
+            raise MaskGenerationError(str(exc)) from exc
+        candidate_path = artifact_dir / f"{candidate['candidate_id']}.json"
+        _atomic_write_json(candidate_path, candidate)
+        return self._candidate_payload(image_id, candidate_path) or candidate
+
+    def save_mask_review(
+        self,
+        image_id: str,
+        instance_id: int,
+        user: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.image_path_for_id(image_id)
+        score = int(payload.get("score"))
+        if score < 0 or score > 3:
+            raise DatasetError("Mask review score must be 0..3.")
+        review_status = str(payload.get("review_status") or _review_status_from_score(score))
+        review = {
+            "schema_version": "mask_review_v1",
+            "candidate_id": payload.get("candidate_id"),
+            "instance_id": int(instance_id),
+            "score": score,
+            "review_status": review_status,
+            "failure_tags": [str(tag) for tag in payload.get("failure_tags") or []],
+            "notes": str(payload.get("notes") or ""),
+            "reviewer": user,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }
+        _atomic_write_json(self._review_path(image_id, instance_id), review)
+        return review
+
+    def clear_mask_review(self, image_id: str, instance_id: int) -> dict[str, Any]:
+        path = self._review_path(image_id, instance_id)
+        if path.exists():
+            path.unlink()
+        return {"cleared": True, "instance_id": int(instance_id)}
+
+    def mask_candidate_preview_path(self, image_id: str, instance_id: int) -> Path:
+        candidate_path = self._latest_candidate_path(image_id, instance_id)
+        candidate = _read_json(candidate_path) if candidate_path else None
+        if not candidate:
+            raise DatasetError("Mask candidate not found.")
+        preview_name = candidate.get("preview_png")
+        if not preview_name:
+            raise DatasetError("Mask candidate preview not found.")
+        preview_path = candidate_path.parent / str(preview_name)
+        if not preview_path.exists():
+            raise DatasetError("Mask candidate preview file is missing.")
+        return preview_path
+
     def save_annotation(
         self,
         image_id: str,
@@ -268,9 +513,16 @@ class WebDataset:
         if not ann.camera:
             ann.camera = img_path.parent.name
 
-        validation = split_validation_messages(validate_annotation(ann, self.class_registry))
+        image_key = self._make_image_key(img_path)
+        validation = split_validation_messages(
+            validate_annotation(ann, self.class_registry),
+            image_key=image_key,
+        )
+        if validation["errors"]:
+            raise DatasetValidationError(validation)
 
         ann.save(ann_path)
+        self._annotation_meta[image_key] = (len(ann.objects), ann.axis_count())
         return {
             "annotation": ann.to_dict(),
             "etag": _annotation_etag(ann_path),
@@ -282,28 +534,23 @@ class WebDataset:
             },
         }
 
-    def validate_annotation_payload(self, img_path: Path) -> dict[str, list[str]]:
+    def validate_annotation_payload(self, img_path: Path) -> dict[str, list[dict[str, Any]]]:
         ann = self.load_annotation(img_path)
-        return split_validation_messages(validate_annotation(ann, self.class_registry))
+        return split_validation_messages(
+            validate_annotation(ann, self.class_registry),
+            image_key=self._make_image_key(img_path),
+        )
 
     def image_entry(self, img_path: Path) -> ImageEntry:
         ann_path = self._get_annotation_path(img_path)
-        object_count = 0
-        grasp_count = 0
-        if ann_path.exists():
-            try:
-                ann = self.load_annotation(img_path)
-                object_count = len(ann.objects)
-                grasp_count = ann.grasp_count()
-            except Exception:
-                pass
+        image_key = self._make_image_key(img_path)
+        object_count, axis_count = self._annotation_meta.get(image_key, (0, 0))
         if not ann_path.exists():
             status = "unannotated"
         elif object_count == 0:
             status = "empty"
         else:
             status = "annotated"
-        image_key = self._make_image_key(img_path)
         return ImageEntry(
             image_id=encode_image_id(image_key),
             image_key=image_key,
@@ -311,14 +558,206 @@ class WebDataset:
             annotation_path=ann_path,
             status=status,
             object_count=object_count,
-            grasp_count=grasp_count,
+            axis_count=axis_count,
         )
 
     def list_images(self, status: str | None = None) -> list[ImageEntry]:
         entries = [self.image_entry(path) for path in self.image_paths]
-        if status and status != "all":
+        if status in {"legacy", "yaw_review", "mask_unreviewed", "mask_low_score"}:
+            entries = [entry for entry in entries if self._matches_review_status(entry, status)]
+        elif status and status != "all":
             entries = [entry for entry in entries if entry.status == status]
         return entries
+
+    def _matches_review_status(self, entry: ImageEntry, status: str) -> bool:
+        ann = self.load_annotation(entry.path).to_dict()
+        objects = ann.get("objects", [])
+        if status == "legacy":
+            return any(str(obj.get("class_name") or "").endswith(LEGACY_CLASS_SUFFIX) for obj in objects)
+        if status == "yaw_review":
+            for obj in objects:
+                class_name = str(obj.get("class_name") or "")
+                has_axis = bool(obj.get("main_axis_points"))
+                if class_name in YAW_SENSITIVE_CLASSES and not has_axis:
+                    return True
+            return False
+        if status == "mask_unreviewed":
+            for obj in objects:
+                instance_id = int(obj.get("instance_id") or 0)
+                if self._latest_candidate_path(entry.image_id, instance_id) and not self._review_path(entry.image_id, instance_id).exists():
+                    return True
+            return False
+        if status == "mask_low_score":
+            for obj in objects:
+                instance_id = int(obj.get("instance_id") or 0)
+                review = _read_json(self._review_path(entry.image_id, instance_id))
+                if review and int(review.get("score") or 0) <= 2:
+                    return True
+            return False
+        return False
+
+    def stats(self) -> dict[str, Any]:
+        class_rows: dict[int, dict[str, Any]] = {}
+        image_rows: list[dict[str, Any]] = []
+        all_issues: list[dict[str, Any]] = []
+        dataset_objects = 0
+        dataset_axis_count = 0
+        dataset_errors = 0
+        dataset_warnings = 0
+        annotated_images = 0
+        empty_images = 0
+        unannotated_images = 0
+
+        if self.class_registry is not None:
+            for cls in self.class_registry.all_classes():
+                class_rows[int(cls.id)] = {
+                    "class_id": int(cls.id),
+                    "class_name": cls.name,
+                    "graspable": bool(cls.graspable),
+                    "image_keys": set(),
+                    "object_count": 0,
+                    "axis_count": 0,
+                    "yaw_valid_count": 0,
+                    "yaw_status_counts": {"valid": 0, "not_required": 0, "ambiguous": 0, "occluded": 0, "optional": 0},
+                    "occlusion_counts": {0: 0, 1: 0, 2: 0, 3: 0},
+                    "difficulty_counts": {"easy": 0, "medium": 0, "hard": 0},
+                    "obb_count": 0,
+                    "error_count": 0,
+                    "warning_count": 0,
+                }
+
+        for img_path in self.image_paths:
+            entry = self.image_entry(img_path)
+            if entry.status == "annotated":
+                annotated_images += 1
+            elif entry.status == "empty":
+                empty_images += 1
+            else:
+                unannotated_images += 1
+            ann = self.load_annotation(img_path)
+            image_key = self._make_image_key(img_path)
+            validation = split_validation_messages(
+                validate_annotation(ann, self.class_registry),
+                image_key=image_key,
+            )
+            dataset_errors += len(validation["errors"])
+            dataset_warnings += len(validation["warnings"])
+            all_issues.extend(validation["errors"])
+            all_issues.extend(validation["warnings"])
+            dataset_objects += len(ann.objects)
+            dataset_axis_count += ann.axis_count()
+
+            instance_classes = {obj.instance_id: obj.class_id for obj in ann.objects}
+            for severity, messages in (("error_count", validation["errors"]), ("warning_count", validation["warnings"])):
+                for issue in messages:
+                    instance_id = issue.get("instance_id")
+                    if instance_id is None:
+                        continue
+                    class_id = instance_classes.get(int(instance_id))
+                    if class_id is not None and class_id in class_rows:
+                        class_rows[class_id][severity] += 1
+
+            image_rows.append(
+                {
+                    **entry.to_dict(),
+                    "error_count": len(validation["errors"]),
+                    "warning_count": len(validation["warnings"]),
+                }
+            )
+
+            for obj in ann.objects:
+                class_id = int(obj.class_id)
+                class_name = obj.class_name or f"class_{obj.class_id}"
+                row = class_rows.setdefault(
+                    class_id,
+                    {
+                        "class_id": class_id,
+                        "class_name": class_name,
+                        "graspable": bool(obj.graspable),
+                        "image_keys": set(),
+                        "object_count": 0,
+                        "axis_count": 0,
+                        "yaw_valid_count": 0,
+                        "yaw_status_counts": {"valid": 0, "not_required": 0, "ambiguous": 0, "occluded": 0, "optional": 0},
+                        "occlusion_counts": {0: 0, 1: 0, 2: 0, 3: 0},
+                        "difficulty_counts": {"easy": 0, "medium": 0, "hard": 0},
+                        "obb_count": 0,
+                        "error_count": 0,
+                        "warning_count": 0,
+                    },
+                )
+                if not row["class_name"] or row["class_name"].startswith("class_"):
+                    row["class_name"] = class_name
+                row["graspable"] = bool(obj.graspable)
+                row["image_keys"].add(image_key)
+                row["object_count"] += 1
+
+                # Axis stats
+                if obj.has_axis:
+                    row["axis_count"] += 1
+
+                # Yaw status counts
+                yaw_status = obj.yaw_label_status
+                if yaw_status in row["yaw_status_counts"]:
+                    row["yaw_status_counts"][yaw_status] += 1
+                if yaw_status == "valid":
+                    row["yaw_valid_count"] += 1
+
+                # Occlusion counts
+                occ = obj.occlusion_level
+                if occ in row["occlusion_counts"]:
+                    row["occlusion_counts"][occ] += 1
+
+                # Difficulty counts
+                diff = obj.difficulty
+                if diff in row["difficulty_counts"]:
+                    row["difficulty_counts"][diff] += 1
+
+                # OBB count
+                if obj.has_obb:
+                    row["obb_count"] += 1
+
+        class_stats = []
+        for row in class_rows.values():
+            object_count = row["object_count"]
+            class_stats.append(
+                {
+                    "class_id": row["class_id"],
+                    "class_name": row["class_name"],
+                    "graspable": row["graspable"],
+                    "image_count": len(row["image_keys"]),
+                    "object_count": object_count,
+                    "axis_count": row["axis_count"],
+                    "yaw_valid_count": row["yaw_valid_count"],
+                    "yaw_status_counts": row["yaw_status_counts"],
+                    "occlusion_counts": row["occlusion_counts"],
+                    "difficulty_counts": row["difficulty_counts"],
+                    "obb_count": row["obb_count"],
+                    "object_share": object_count / dataset_objects if dataset_objects else 0.0,
+                    "error_count": row["error_count"],
+                    "warning_count": row["warning_count"],
+                    "suggestions": _class_suggestions_v2(row),
+                }
+            )
+
+        class_stats.sort(key=lambda item: item["class_id"])
+        image_rows.sort(key=lambda item: (-item["error_count"], -item["warning_count"], item["image_key"]))
+        return {
+            "dataset": {
+                "image_count": len(self.image_paths),
+                "annotated_image_count": annotated_images,
+                "empty_image_count": empty_images,
+                "unannotated_image_count": unannotated_images,
+                "class_count": len(class_stats),
+                "object_count": dataset_objects,
+                "axis_count": dataset_axis_count,
+                "error_count": dataset_errors,
+                "warning_count": dataset_warnings,
+            },
+            "classes": class_stats,
+            "images": image_rows,
+            "issues": all_issues[:500],
+        }
 
     def delete_image(self, image_id: str) -> dict[str, Any]:
         img_path = self.image_path_for_id(image_id)
@@ -342,6 +781,7 @@ class WebDataset:
 
         self._image_paths = [path for path in self._image_paths if path != img_path]
         self._image_by_key = {self._make_image_key(path): path for path in self._image_paths}
+        self._annotation_meta.pop(image_key, None)
         return {
             "image_id": image_id,
             "image_key": image_key,
@@ -438,6 +878,23 @@ class DatasetService:
     def __init__(self, config: WebConfig, store: StateStore):
         self.config = config
         self.store = store
+        self._cache: OrderedDict[str, WebDataset] = OrderedDict()
+        self._max_cache = 32
+
+    def _cached_dataset(self, root: Path) -> WebDataset:
+        key = str(root.resolve())
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        while len(self._cache) >= self._max_cache:
+            self._cache.popitem(last=False)
+        ds = WebDataset(root)
+        self._cache[key] = ds
+        self._cache.move_to_end(key)
+        return ds
+
+    def _invalidate_cache(self, root: Path) -> None:
+        self._cache.pop(str(root.resolve()), None)
 
     @property
     def managed_root(self) -> Path:
@@ -487,6 +944,12 @@ class DatasetService:
         rows = self.store.list_datasets()
         return [self._metadata_from_row(row) for row in rows]
 
+    def clear_cache_for(self, root: Path) -> None:
+        key = str(root.resolve())
+        if key in self._cache:
+            self._cache[key]._refresh_images()
+            self._cache.pop(key, None)
+
     def open_dataset(self, path: str | Path, source: str = "server") -> dict[str, Any]:
         root = resolve_allowed_path(path, self.config.dataset_roots + [self.config.upload_root])
         dataset = WebDataset(root)
@@ -497,7 +960,7 @@ class DatasetService:
         row = self.store.get_dataset(dataset_id)
         if row is None:
             raise DatasetError(f"Unknown dataset: {dataset_id}")
-        dataset = WebDataset(row["root"])
+        dataset = self._cached_dataset(Path(row["root"]))
         return row, dataset
 
     def create_dataset(

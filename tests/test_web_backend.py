@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from io import BytesIO
 
@@ -10,9 +11,11 @@ import yaml
 from PIL import Image
 
 from assistive_grasp_annotator.web.config import WebConfig, resolve_allowed_path
-from assistive_grasp_annotator.web.datasets import DatasetError, DatasetService
+from assistive_grasp_annotator.web.datasets import DatasetError, DatasetService, DatasetValidationError
 from assistive_grasp_annotator.web.ids import decode_image_id, encode_image_id
 from assistive_grasp_annotator.web.state import StateStore
+from assistive_grasp_annotator.tools.audit_annotations import audit_annotations
+from assistive_grasp_annotator.tools.migrate_new_dataset import migrate_dataset
 
 
 def make_dataset(root: Path) -> Path:
@@ -24,7 +27,7 @@ def make_dataset(root: Path) -> Path:
     Image.new("RGB", (80, 60), (120, 80, 40)).save(images_dir / "000001.jpg")
     with open(root / "classes.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(
-            {"classes": [{"id": 0, "name": "box", "graspable": True, "policy": "grasp_rect"}]},
+            {"classes": [{"id": 0, "name": "phone", "graspable": True}]},
             f,
             sort_keys=False,
         )
@@ -44,20 +47,15 @@ def sample_annotation() -> dict:
             {
                 "instance_id": 1,
                 "class_id": 0,
-                "class_name": "box",
+                "class_name": "phone",
                 "bbox_xyxy": [10, 10, 50, 40],
                 "graspable": True,
-                "policy": "grasp_rect",
-                "grasps": [
-                    {
-                        "grasp_id": 1,
-                        "points": [[20, 20], [40, 20], [40, 30], [20, 30]],
-                        "axis_convention": "p0_to_p1_is_grasp_width_axis",
-                        "quality": 1.0,
-                        "difficulty": "easy",
-                        "note": "",
-                    }
-                ],
+                "template_id": "phone",
+                "yaw_label_status": "valid",
+                "occlusion_level": 0,
+                "difficulty": "easy",
+                "main_axis_points": [[20, 20], [40, 20]],
+                "notes": "",
             }
         ],
     }
@@ -66,15 +64,16 @@ def sample_annotation() -> dict:
 def invalid_intermediate_annotation() -> dict:
     data = sample_annotation()
     data["objects"][0]["bbox_xyxy"] = [50, 40, 10, 10]
-    data["objects"][0]["grasps"][0]["difficulty"] = "strange"
+    data["objects"][0]["yaw_label_status"] = "invalid_status"
     return data
 
 
 def warning_annotation() -> dict:
     data = sample_annotation()
     data["objects"][0]["class_id"] = 1
-    data["objects"][0]["class_name"] = "other"
-    data["objects"][0]["graspable"] = False
+    data["objects"][0]["class_name"] = "phone_other"
+    data["objects"][0]["graspable"] = True
+    data["objects"][0]["yaw_label_status"] = "optional"
     return data
 
 
@@ -111,7 +110,10 @@ class WebBackendTests(unittest.TestCase):
             saved = dataset.save_annotation(entry.image_id, sample_annotation(), payload["etag"])
             self.assertTrue(saved["validation"]["valid"])
             self.assertNotEqual(saved["etag"], "missing")
-            self.assertEqual(saved["annotation"]["objects"][0]["class_name"], "box")
+            self.assertEqual(saved["annotation"]["objects"][0]["class_name"], "phone")
+            audit = audit_annotations(root)
+            self.assertEqual(audit["annotation_count"], 1)
+            self.assertEqual(audit["error_count"], 0)
 
             with self.assertRaises(DatasetError):
                 dataset.save_annotation(entry.image_id, sample_annotation(), "missing")
@@ -130,7 +132,7 @@ class WebBackendTests(unittest.TestCase):
             service = DatasetService(config, store)
             created = service.create_dataset(
                 "Bench Set",
-                classes=[{"id": 0, "name": "box", "graspable": True, "policy": "grasp_rect"}],
+                classes=[{"id": 0, "name": "phone", "graspable": True}],
             )
             dataset_id = created["dataset_id"]
             root = Path(created["root"])
@@ -167,7 +169,7 @@ class WebBackendTests(unittest.TestCase):
             self.assertEqual(listed[0]["name"], "existing_case")
             self.assertEqual(Path(listed[0]["root"]), existing)
 
-    def test_save_invalid_intermediate_annotation_without_blocking(self):
+    def test_save_invalid_annotation_is_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_dataset(Path(tmp) / "dataset")
             config = WebConfig(
@@ -184,10 +186,10 @@ class WebBackendTests(unittest.TestCase):
             entry = dataset.list_images()[0]
             payload = dataset.annotation_payload(entry.image_id)
 
-            saved = dataset.save_annotation(entry.image_id, invalid_intermediate_annotation(), payload["etag"])
-            self.assertFalse(saved["validation"]["valid"])
-            self.assertGreaterEqual(len(saved["validation"]["errors"]), 1)
-            self.assertTrue((root / "annotations" / "camera_1" / "000001.json").exists())
+            with self.assertRaises(DatasetValidationError) as raised:
+                dataset.save_annotation(entry.image_id, invalid_intermediate_annotation(), payload["etag"])
+            self.assertGreaterEqual(len(raised.exception.validation["errors"]), 1)
+            self.assertFalse((root / "annotations" / "camera_1" / "000001.json").exists())
 
     def test_locks_exclude_other_users(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -207,6 +209,36 @@ class WebBackendTests(unittest.TestCase):
 
 
 class WebApiTests(unittest.TestCase):
+    def test_api_accepts_header_auth_without_cookie(self):
+        try:
+            from fastapi.testclient import TestClient
+            from assistive_grasp_annotator.web.app import create_app
+        except Exception as exc:  # pragma: no cover - optional runtime dependency in minimal envs
+            self.skipTest(f"FastAPI test dependencies unavailable: {exc}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_dataset(Path(tmp) / "dataset")
+            config = WebConfig(
+                dataset_roots=[root.parent.resolve()],
+                upload_root=(Path(tmp) / "uploads").resolve(),
+                state_db=(Path(tmp) / "state.sqlite3").resolve(),
+                lock_ttl_seconds=60,
+                frontend_dist=(Path(tmp) / "dist").resolve(),
+            )
+            client = TestClient(create_app(config))
+            protected = client.post("/api/datasets/open", json={"path": str(root)})
+            self.assertEqual(protected.status_code, 401)
+
+            headers = {"X-AGA-User": "lan%20user"}
+            opened = client.post("/api/datasets/open", json={"path": str(root)}, headers=headers)
+            self.assertEqual(opened.status_code, 200, opened.text)
+            dataset_id = opened.json()["dataset_id"]
+            image_id = client.get(f"/api/datasets/{dataset_id}/images").json()["items"][0]["image_id"]
+
+            lock = client.post(f"/api/datasets/{dataset_id}/images/{image_id}/lock", headers=headers)
+            self.assertEqual(lock.status_code, 200, lock.text)
+            self.assertEqual(lock.json()["user"], "lan user")
+
     def test_api_edit_flow(self):
         try:
             from fastapi.testclient import TestClient
@@ -247,6 +279,100 @@ class WebApiTests(unittest.TestCase):
             )
             self.assertEqual(save.status_code, 200, save.text)
             self.assertTrue((root / "annotations" / "camera_1" / "000001.json").exists())
+            stats = client.get(f"/api/datasets/{dataset_id}/stats")
+            self.assertEqual(stats.status_code, 200, stats.text)
+            self.assertEqual(stats.json()["dataset"]["image_count"], 1)
+            self.assertEqual(stats.json()["dataset"]["object_count"], 1)
+            self.assertEqual(stats.json()["classes"][0]["axis_count"], 1)
+
+    def test_mask_candidate_and_review_flow(self):
+        try:
+            from fastapi.testclient import TestClient
+            from assistive_grasp_annotator.web.app import create_app
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"FastAPI test dependencies unavailable: {exc}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_dataset(Path(tmp) / "dataset")
+            config = WebConfig(
+                dataset_roots=[root.parent.resolve()],
+                upload_root=(Path(tmp) / "uploads").resolve(),
+                state_db=(Path(tmp) / "state.sqlite3").resolve(),
+                lock_ttl_seconds=60,
+                frontend_dist=(Path(tmp) / "dist").resolve(),
+            )
+            client = TestClient(create_app(config))
+            client.post("/api/login", json={"username": "alice"})
+            dataset_id = client.post("/api/datasets/open", json={"path": str(root)}).json()["dataset_id"]
+            image_id = client.get(f"/api/datasets/{dataset_id}/images").json()["items"][0]["image_id"]
+            ann_payload = client.get(f"/api/datasets/{dataset_id}/images/{image_id}/annotation").json()
+            lock = client.post(f"/api/datasets/{dataset_id}/images/{image_id}/lock").json()
+            save = client.put(
+                f"/api/datasets/{dataset_id}/images/{image_id}/annotation",
+                json={
+                    "lock_id": lock["lock_id"],
+                    "lock_token": lock["lock_token"],
+                    "etag": ann_payload["etag"],
+                    "annotation": sample_annotation(),
+                },
+            )
+            self.assertEqual(save.status_code, 200, save.text)
+
+            with mock.patch.dict("os.environ", {"AGA_MASK_TEACHER_MODE": "fake"}):
+                candidate = client.post(f"/api/datasets/{dataset_id}/images/{image_id}/objects/1/mask-candidate")
+            self.assertEqual(candidate.status_code, 200, candidate.text)
+            body = candidate.json()
+            self.assertEqual(body["schema_version"], "mask_candidate_v1")
+            self.assertGreater(len(body["smooth_contour_px"]), 32)
+            self.assertTrue((root / "generated" / "mask_candidates").exists())
+
+            preview = client.get(f"/api/datasets/{dataset_id}/images/{image_id}/objects/1/mask-candidate/preview")
+            self.assertEqual(preview.status_code, 200, preview.text)
+            self.assertEqual(preview.headers["content-type"], "image/png")
+
+            review = client.put(
+                f"/api/datasets/{dataset_id}/images/{image_id}/objects/1/mask-review",
+                json={"candidate_id": body["candidate_id"], "score": 2, "failure_tags": ["edge_miss"], "notes": "usable"},
+            )
+            self.assertEqual(review.status_code, 200, review.text)
+            self.assertEqual(review.json()["review_status"], "usable")
+            mask_payload = client.get(f"/api/datasets/{dataset_id}/images/{image_id}/mask-review")
+            self.assertEqual(mask_payload.status_code, 200, mask_payload.text)
+            self.assertEqual(mask_payload.json()["objects"][0]["review"]["score"], 2)
+
+    def test_new_dataset_migration_canonicalizes_legacy_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "new_dataset"
+            images_dir = root / "images" / "camera_1"
+            ann_dir = root / "annotations" / "camera_1"
+            images_dir.mkdir(parents=True)
+            ann_dir.mkdir(parents=True)
+            (root / "splits").mkdir()
+            (root / "generated").mkdir()
+            Image.new("RGB", (80, 60), (120, 80, 40)).save(images_dir / "000001.jpg")
+            with open(root / "classes.yaml", "w", encoding="utf-8") as f:
+                yaml.safe_dump(
+                    {"classes": [{"id": 0, "name": "earbud", "graspable": True}]},
+                    f,
+                    sort_keys=False,
+                )
+            ann = sample_annotation()
+            ann["objects"][0]["class_id"] = 0
+            ann["objects"][0]["class_name"] = "earbud" + "_" + "A"
+            ann["objects"][0]["yaw_label_status"] = "optional"
+            (ann_dir / "000001.json").write_text(json.dumps(ann), encoding="utf-8")
+
+            dry_run = migrate_dataset(root, apply=False)
+            self.assertEqual(dry_run["changed_files"], 1)
+            self.assertEqual(json.loads((ann_dir / "000001.json").read_text(encoding="utf-8"))["objects"][0]["class_name"], "earbud" + "_" + "A")
+
+            applied = migrate_dataset(root, apply=True)
+            self.assertEqual(applied["legacy_class_name_count"], 1)
+            migrated = json.loads((ann_dir / "000001.json").read_text(encoding="utf-8"))
+            self.assertEqual(migrated["objects"][0]["class_name"], "earbud")
+            self.assertEqual(migrated["objects"][0]["yaw_label_status"], "valid")
+            second = migrate_dataset(root, apply=False)
+            self.assertEqual(second["changed_files"], 0)
 
     def test_api_dataset_library_flow(self):
         try:
@@ -271,7 +397,7 @@ class WebApiTests(unittest.TestCase):
                 "/api/datasets",
                 json={
                     "name": "Library Case",
-                    "classes": [{"id": 0, "name": "box", "graspable": True, "policy": "grasp_rect"}],
+                    "classes": [{"id": 0, "name": "phone", "graspable": True}],
                 },
             )
             self.assertEqual(created.status_code, 200, created.text)
@@ -304,8 +430,8 @@ class WebApiTests(unittest.TestCase):
                 yaml.safe_dump(
                     {
                         "classes": [
-                            {"id": 0, "name": "box", "graspable": True, "policy": "grasp_rect"},
-                            {"id": 1, "name": "other", "graspable": False, "policy": "report_only"},
+                            {"id": 0, "name": "phone", "graspable": True},
+                            {"id": 1, "name": "remote", "graspable": False},
                         ]
                     },
                     f,
@@ -349,7 +475,7 @@ class WebApiTests(unittest.TestCase):
                     "name": "upload_case",
                     "camera_name": "cam_a",
                     "upload_batch_id": "new-batch-1",
-                    "classes_json": json.dumps([{"id": 0, "name": "box", "graspable": True, "policy": "grasp_rect"}]),
+                    "classes_json": json.dumps([{"id": 0, "name": "phone", "graspable": True}]),
                 },
                 files={"files": ("one.png", upload_image, "image/png")},
             )
@@ -368,7 +494,7 @@ class WebApiTests(unittest.TestCase):
                     "name": "upload_case",
                     "camera_name": "cam_a",
                     "upload_batch_id": "new-batch-1",
-                    "classes_json": json.dumps([{"id": 0, "name": "box", "graspable": True, "policy": "grasp_rect"}]),
+                    "classes_json": json.dumps([{"id": 0, "name": "phone", "graspable": True}]),
                 },
                 files={"files": ("one.png", repeated_upload_image, "image/png")},
             )
@@ -399,7 +525,7 @@ class WebApiTests(unittest.TestCase):
                     "upload_batch_id": "new-chunked-batch-1",
                     "name": "chunked_upload_case",
                     "camera_name": "cam_b",
-                    "classes": [{"id": 0, "name": "box", "graspable": True, "policy": "grasp_rect"}],
+                    "classes": [{"id": 0, "name": "phone", "graspable": True}],
                     "files": [{"file_id": "file-new", "filename": "new_chunked.png", "size": len(chunked_new_bytes)}],
                 },
             )
@@ -431,23 +557,23 @@ class WebApiTests(unittest.TestCase):
                 f"/api/datasets/{dataset_id}/classes",
                 json={
                     "classes": [
-                        {"id": 0, "name": "cup_A", "graspable": True, "policy": "grasp_rect"},
-                        {"id": 1, "name": "book", "graspable": False, "policy": "report_only"},
+                        {"id": 0, "name": "phone", "graspable": True},
+                        {"id": 1, "name": "remote", "graspable": True},
                     ]
                 },
             )
             self.assertEqual(updated.status_code, 200, updated.text)
-            self.assertEqual(updated.json()["classes"][1]["name"], "book")
+            self.assertEqual(updated.json()["classes"][1]["name"], "remote")
             with open(root / "classes.yaml", "r", encoding="utf-8") as f:
                 saved = yaml.safe_load(f)
-            self.assertEqual(saved["classes"][0]["name"], "cup_A")
+            self.assertEqual(saved["classes"][0]["name"], "phone")
 
             duplicate = client.put(
                 f"/api/datasets/{dataset_id}/classes",
                 json={
                     "classes": [
-                        {"id": 0, "name": "cup_A", "graspable": True, "policy": "grasp_rect"},
-                        {"id": 0, "name": "cup_B", "graspable": True, "policy": "grasp_rect"},
+                        {"id": 0, "name": "phone", "graspable": True},
+                        {"id": 0, "name": "remote", "graspable": True},
                     ]
                 },
             )

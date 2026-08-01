@@ -1,4 +1,4 @@
-import { CheckCircle2, Crosshair, Hand, Lock, MousePointer2, Save, Square, Trash2, Unlock } from "lucide-react";
+import { CheckCircle2, Hand, Lock, Minus, MousePointer2, Save, ScanLine, Square, Trash2, Unlock } from "lucide-react";
 import type { LockInfo, Mode } from "../types";
 
 type Props = {
@@ -33,14 +33,17 @@ export function Toolbar({
   return (
     <header className="toolbar">
       <div className="mode-group" role="toolbar" aria-label="Mode">
-        <button className={mode === "select" ? "active" : ""} title="Select (V)" onClick={() => onModeChange("select")}>
+        <button className={mode === "select" ? "active" : ""} title="Select (Q)" onClick={() => onModeChange("select")}>
           <MousePointer2 size={16} />
         </button>
-        <button className={mode === "bbox" ? "active" : ""} title="BBox (A)" onClick={() => onModeChange("bbox")}>
+        <button className={mode === "bbox" ? "active" : ""} title="BBox (C)" onClick={() => onModeChange("bbox")}>
           <Square size={16} />
         </button>
-        <button className={mode === "grasp" ? "active" : ""} title="Grasp (G)" onClick={() => onModeChange("grasp")}>
-          <Crosshair size={16} />
+        <button className={mode === "axis" ? "active" : ""} title="Axis (E)" onClick={() => onModeChange("axis")}>
+          <Minus size={16} />
+        </button>
+        <button className={mode === "mask" ? "active" : ""} title="Mask Review (M)" onClick={() => onModeChange("mask")}>
+          <ScanLine size={16} />
         </button>
         <button className={mode === "pan" ? "active" : ""} title="Pan" onClick={() => onModeChange("pan")}>
           <Hand size={16} />
@@ -69,4 +72,3 @@ export function Toolbar({
     </header>
   );
 }
-
