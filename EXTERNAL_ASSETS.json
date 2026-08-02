@@ -1,0 +1,13 @@
+{
+  "schema_version": "assistive_grasp.external_asset_pointer.v1",
+  "repository": "CodeMzt/AssistiveGraspAnnotator",
+  "source_commit": "cd0cac38ed7f07b4013c551555b32a8b0b45be19",
+  "domain_prefix": "annotator",
+  "status": "retained_dataset_inputs_and_annotations",
+  "motion_authority": false,
+  "canonical_assets": {
+    "data_manifest": "D:/AssistiveGraspData/vision-training/cross-model/20260801-closeout/MANIFEST.json",
+    "data_manifest_sha256": "9DB55F9025557D6CC45270D732E8CD87141A504F598E8BCC1004169EB6F507A5"
+  },
+  "migration_receipt_sha256": "4A337D3843CC368E752BCAF3370795E2C0915D89956B9C722A941ED3F0224229"
+}
